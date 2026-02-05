@@ -326,12 +326,9 @@ def match_and_postprocess(
                     continue
                 for fi in range(num_f):
                     if parsed_gt_track[gt_tid]["valids"][fi] and parsed_pred_track[matched_pred_tid]["valids"][fi]:
-                        collector[gt_tid]["smpl"]["global_orient"][idx, fi] = \
-                        parsed_pred_track[matched_pred_tid]["smpl"]["global_orient"][fi].clone()
-                        collector[gt_tid]["smpl"]["body_pose"][idx, fi] = \
-                        parsed_pred_track[matched_pred_tid]["smpl"]["body_pose"][fi].clone()
-                        collector[gt_tid]["smpl"]["betas"][idx, fi] = \
-                        parsed_pred_track[matched_pred_tid]["smpl"]["betas"][fi].clone()
+                        collector[gt_tid]["smpl"]["global_orient"][idx, fi] = parsed_pred_track[matched_pred_tid]["smpl"]["global_orient"][fi].clone()
+                        collector[gt_tid]["smpl"]["body_pose"][idx, fi] = parsed_pred_track[matched_pred_tid]["smpl"]["body_pose"][fi].clone()
+                        collector[gt_tid]["smpl"]["betas"][idx, fi] = parsed_pred_track[matched_pred_tid]["smpl"]["betas"][fi].clone()
                         collector[gt_tid]["camera"][idx, fi] = parsed_pred_track[matched_pred_tid]["camera"][fi].clone()
                         collector[gt_tid]["matched_mask"][idx, fi] = 1
         

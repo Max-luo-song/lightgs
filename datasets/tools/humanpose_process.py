@@ -126,12 +126,18 @@ if __name__ == "__main__":
     elif args.split_file is not None:
         # parse the split file
         split_file = open(args.split_file, "r").readlines()[1:]
-        try:
-            # Waymo, Pandaset, Argoverse, NuScenes
+        # 根据数据集类型选择合适的解析方式
+        if args.dataset in ["waymo", "pandaset", "argoverse", "nuscenes"]:
+            # CSV格式，逗号分隔，第一列是数字ID
             scene_ids_list = [int(line.strip().split(",")[0]) for line in split_file]
-        except:
-            # KITTI
+        elif args.dataset == "kitti":
+            # 空格分隔格式
             scene_ids_list = [line.strip().split(" ")[0] for line in split_file]
+        elif args.dataset == "qcraft":
+            # QCraft格式，逗号分隔，但ID可能是字符串
+            scene_ids_list = [line.strip().split(",")[0] for line in split_file]
+        else:
+            raise ValueError(f"Unsupported dataset {args.dataset} for split file parsing")
     else:
         scene_ids_list = np.arange(args.start_idx, args.start_idx + args.num_scenes)
 

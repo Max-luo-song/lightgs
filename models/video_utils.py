@@ -34,13 +34,14 @@ def non_zero_mean(x: Tensor) -> float:
     return float(sum(x) / len(x) if len(x) > 0 else -1)
 
 
-def compute_psnr(prediction: Tensor, target: Tensor) -> float:
+def compute_psnr(prediction: Tensor, target: Tensor, eps: float = 1e-10) -> float:
     """
     Computes the Peak Signal-to-Noise Ratio (PSNR) between the prediction and target tensors.
 
     Args:
         prediction (torch.Tensor): The predicted tensor.
         target (torch.Tensor): The target tensor.
+        eps (float): 1e-10 make max(psnr)<=100.
 
     Returns:
         float: The PSNR value between the prediction and target tensors.
@@ -49,7 +50,7 @@ def compute_psnr(prediction: Tensor, target: Tensor) -> float:
         prediction = Tensor(prediction)
     if not isinstance(target, Tensor):
         target = Tensor(target).to(prediction.device)
-    return (-10 * torch.log10(F.mse_loss(prediction, target))).item()
+    return (-10 * torch.log10(F.mse_loss(prediction, target) + eps)).item()
 
 
 def render_images(
@@ -1467,6 +1468,8 @@ def save_seperate_images(
                 continue
 
         cam_names = render_results["cam_names"]
+        cam_ids = render_results["cam_ids"]
+
         # skip if the key is not in render_results
         if "mask" in key:
             new_key = key.replace("mask", "opacities")
@@ -1499,7 +1502,7 @@ def save_seperate_images(
 
         for j, frame in enumerate(frames):
             imageio.imwrite(
-                img_save_pth.replace(".png", f"/{timestamps:06d}_{j:03d}.png"),
+                img_save_pth.replace(".png", f"/{timestamps:06d}_{cam_ids[j]:03d}.png"),
                 to8b(frame),
             )
         tiled_img = layout(frames, cam_names)

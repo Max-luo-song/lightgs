@@ -236,13 +236,13 @@ def main(args):
     
     # define render keys
     render_keys = [   ## 体现在output里面的images中，每隔几k就会输出
-        # "gt_rgbs",
+        "gt_rgbs",
         "rgbs",
         "Background_rgbs",
-        # "Dynamic_rgbs",
-        # "RigidNodes_rgbs",
-        # "DeformableNodes_rgbs",
-        # "SMPLNodes_rgbs",
+        "Dynamic_rgbs",
+        "RigidNodes_rgbs",
+        "DeformableNodes_rgbs",
+        "SMPLNodes_rgbs",
         "depths",
         # "Background_depths",
         # "Dynamic_depths",
@@ -250,7 +250,7 @@ def main(args):
         # "DeformableNodes_depths",
         # "SMPLNodes_depths",
         # "mask"
-        # "gt_road_rgbs",
+        "gt_road_rgbs",
         "road_rgbs"
     ]
     if cfg.render.vis_lidar:

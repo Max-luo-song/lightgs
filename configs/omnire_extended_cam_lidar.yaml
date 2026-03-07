@@ -300,7 +300,6 @@ model:
       freeze_s: false
       freeze_shs_dc: false
       freeze_shs_rest: false
-  
   Sky:
     type: models.modules.EnvLight
     params:

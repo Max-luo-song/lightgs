@@ -33,7 +33,7 @@ data:
     load_sky_mask: True # whether to load sky mask
     load_dynamic_mask: True # whether to load dynamic mask
     load_objects: True # whether to load object bounding boxes
-    load_smpl: False # whether to load SMPL template for pedestrians
+    load_smpl: True # whether to load SMPL template for pedestrians
     load_road_mask: True
     sampler: # error based image sampler
       buffer_downscale: 8 # downscale factor for the buffer wrt load_size

@@ -16,7 +16,7 @@
 #    12   rear_50               (1024, 512)
 
 data:
-  data_root: /nas_thoru/users/liuzy/scene_reconstruction_data/Q3716/processed # data root for the dataset
+  data_root: data/qcraft/processed/training # data root for the dataset
   dataset: qcraft 
   scene_idx: 0 # which scene to use
   start_timestep: 0 # which timestep to start from

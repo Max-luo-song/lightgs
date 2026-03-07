@@ -4,11 +4,11 @@ ckpt_path="output/qcraft_20251103_134932_QLC0N1000623_12337_12352/20251121_lidar
 
 traj_types=(
     original_traj
-    # left_shift_1m
+    left_shift_1m
     left_shift_3m
     # left_shift_5m
-    # right_shift_1m
-    # right_shift_3m
+    right_shift_1m
+    right_shift_3m
     # right_shift_5m
     # front_shift_1m
     # front_shift_3m
@@ -21,9 +21,11 @@ traj_types=(
     # change_lane_3.5m
 )
 
-cam_ids=(0 1 2 3 4 5 6 7 8 9 10 11 12)
-downscales=(1 1 1 1 1 1 1 1 1 1 1 1 1)
+cam_ids=(0 1 2 3 5 6 7 9 10 11 12)
+downscales=(1 1 1 1 1 1 1 1 1 1 1)
 
+# cam_ids=(0 1)
+# downscales=(1 1)
 fps=10
 
 render_rgb=true

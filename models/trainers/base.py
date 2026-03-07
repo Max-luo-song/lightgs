@@ -26,6 +26,7 @@ class GSModelType(IntEnum):
     SMPLNodes = 2
     DeformableNodes = 3
     TrafficLightNodes = 4
+    RoadNodes = 5
 
 def lr_scheduler_fn(
     cfg: OmegaConf,
@@ -125,7 +126,9 @@ class BasicTrainer(nn.Module):
         
         # a simple viewer for background visualization
         self.viewer = None
-    
+
+        # keep gaussian
+        self.gs = None
     @property
     def in_test_set(self):
         return self.cur_frame.item() in self.test_set_indices
@@ -249,7 +252,15 @@ class BasicTrainer(nn.Module):
                 use_inverse_depth=depth_loss_cfg.inverse_depth,
             )
         self.depth_loss_fn = depth_loss_fn
-    
+        
+        if "RoadNodes" in self.models:
+            road_loss_fn = None
+            road_loss_cfg = self.losses_dict.get("road", None)
+            if road_loss_cfg is not None:
+                from models.losses import RoadLoss
+                road_loss_fn = RoadLoss()  # TODO(gls): args
+                self.road_loss_fn = road_loss_fn
+ 
     def optimizer_zero_grad(self) -> None:
         self.optimizer.zero_grad()
     
@@ -406,6 +417,18 @@ class BasicTrainer(nn.Module):
         if self.render_dynamic_mask:
             self.dynamic_pts_mask = (self.pts_labels != 0).float()
 
+        # --- 新增部分：创建并返回 freeze_mask ---
+        # 1. 找到 "RoadNodes" 对应的类别 ID
+        road_class_id = self.gaussian_classes.get("RoadNodes")
+        
+        if road_class_id is not None:
+            # 2. 创建布尔掩码，路面高斯的位置为 True
+            freeze_mask = (self.pts_labels == road_class_id)
+        else:
+            # 如果没有 "RoadNodes" 这个类别，则不冻结任何东西
+            freeze_mask = torch.zeros_like(self.pts_labels, dtype=torch.bool)
+        # --- 新增部分结束 ---
+            
         gaussians = dataclass_gs(
             _means=gs_dict["_means"],
             _scales=gs_dict["_scales"],
@@ -416,7 +439,7 @@ class BasicTrainer(nn.Module):
             extras=None        # to save some extra information (TODO) more flexible way
         )
         
-        return gaussians
+        return gaussians, freeze_mask
     
     def render_gaussians(
         self,
@@ -507,7 +530,7 @@ class BasicTrainer(nn.Module):
             image_ids=image_infos["img_idx"].flatten()[0],
             novel_view=novel_view
         )
-        gs = self.collect_gaussians(
+        gs, _ = self.collect_gaussians(
             cam=processed_cam,
             image_ids=image_infos["img_idx"].flatten()[0]
         )
@@ -555,6 +578,7 @@ class BasicTrainer(nn.Module):
         outputs: Dict[str, torch.Tensor],
         image_infos: Dict[str, torch.Tensor],
         cam_infos: Dict[str, torch.Tensor],
+        gs
     ) -> Dict[str, torch.Tensor]:
         # calculate loss
         loss_dict = {}
@@ -564,14 +588,21 @@ class BasicTrainer(nn.Module):
             valid_loss_mask = (1.0 - image_infos["egocar_masks"]).float()
         else:
             valid_loss_mask = torch.ones_like(image_infos["sky_masks"])
-            
+
+        ### NOTE(gls)： 在rgb的loss计算上，路面和非路面区域区分计算(实验验证分开略有增益)
+        road_mask = image_infos["road_masks"]
+        non_road_mask = ~road_mask.bool()
+
         gt_rgb = image_infos["pixels"] * valid_loss_mask[..., None]
+        gt_rgb = gt_rgb * non_road_mask[..., None]
+        
         predicted_rgb = outputs["rgb"] * valid_loss_mask[..., None]
+        predicted_rgb = predicted_rgb * non_road_mask[..., None]
         
         gt_occupied_mask = (1.0 - image_infos["sky_masks"]).float() * valid_loss_mask
         pred_occupied_mask = outputs["opacity"].squeeze() * valid_loss_mask
         
-        # rgb loss
+        ### NOTE(gls): 非路面区域的rgb_loss
         Ll1 = torch.abs(gt_rgb - predicted_rgb).mean()
         simloss = 1 - self.ssim(gt_rgb.permute(2, 0, 1)[None, ...], predicted_rgb.permute(2, 0, 1)[None, ...])
         loss_dict.update({
@@ -606,6 +637,26 @@ class BasicTrainer(nn.Module):
             else:
                 logger.debug("No valid lidar points for depth loss")
             
+
+        # NOTE(gls): add road loss
+        if self.road_loss_fn is not None:
+            road_mask = image_infos["road_masks"]
+            gt_rgb = image_infos["pixels"] * valid_loss_mask[..., None]
+            gt_road_rgb = gt_rgb * road_mask[..., None]
+            pred_road_rgb = outputs['road_rgb'] * valid_loss_mask[..., None]
+
+            # NOTE(gls)：路面相关参数可以单独传入(暂时不用，后面设计复杂loss可能启用)
+            # freeze_mask = outputs["freeze_mask"]
+            # road_quats = gs.quats[freeze_mask]
+            # road_scales = gs.scales[freeze_mask]
+            Ll1 = self.road_loss_fn(pred_road_rgb, gt_road_rgb)
+            simloss_road = 1 - self.ssim(gt_road_rgb.permute(2, 0, 1)[None, ...], pred_road_rgb.permute(2, 0, 1)[None, ...])
+            road_loss = Ll1 * self.losses_dict.road.w
+            simloss_road = simloss_road * self.losses_dict.ssim.w
+            loss_dict.update({"road_loss": road_loss})
+            loss_dict.update({"ssim_road_loss": simloss_road})
+
+        # 不透明度的熵正则化，其主要作用是鼓励不透明度预测值趋向于两极化（即非常接近0或非常接近1）。
         # ----- reg loss -----
         opacity_entropy_reg = self.losses_dict.get("opacity_entropy", None)
         if opacity_entropy_reg is not None:

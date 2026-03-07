@@ -45,6 +45,9 @@ SMPLNODE_CLASSES = ["Pedestrian"]
 
 class QcraftCameraData(CameraData):
     def __init__(self, **kwargs):
+        self.cam_to_worlds = None
+        self.intrinsics = None
+        self.distortions = None
         super().__init__(**kwargs)
         if self.mix_novel_alias and self.mix_novel_alias:
             self.load_novel_pose()
@@ -256,6 +259,7 @@ class QcraftPixelSource(ScenePixelSource):
                 end_timestep=self.end_timestep,
                 load_dynamic_mask=self.data_cfg.load_dynamic_mask,
                 load_sky_mask=self.data_cfg.load_sky_mask,
+                load_road_mask=self.data_cfg.load_road_mask,
                 downscale_when_loading=self.data_cfg.downscale_when_loading[idx],
                 undistort=self.data_cfg.undistort,
                 buffer_downscale=self.buffer_downscale,
@@ -317,6 +321,7 @@ class QcraftPixelSource(ScenePixelSource):
                 cam_id=cam_id,
                 start_timestep=self.start_timestep,
                 end_timestep=self.end_timestep,
+                load_road_mask=self.data_cfg.load_road_mask,
                 downscale_when_loading=downscale_when_loading[idx],
                 undistort=False,
                 buffer_downscale=self.buffer_downscale,

@@ -179,3 +179,22 @@ class DepthLoss(nn.Module):
             raise NotImplementedError(f"Unknown reduction method: {self.reduction}")
 
         return depth_error
+
+### NOTE(gls): 路面Loss目前只包括rgb loss
+class RoadLoss(nn.Module):
+    def __init__(self):
+        super(RoadLoss, self).__init__() 
+
+    def _compute_road_loss(self, pred_road_rgb: torch.Tensor, gt_road_rgb: torch.Tensor) -> torch.Tensor:
+        Ll1 = torch.abs(gt_road_rgb - pred_road_rgb).mean()
+        return Ll1
+
+    def __call__(
+        self,
+        pred_road_rgb: Tensor,
+        gt_road_rgb: Tensor
+        # road_quats: Tensor,
+        # road_scales: Tensor
+    ):
+        road_loss = self._compute_road_loss(pred_road_rgb, gt_road_rgb)
+        return road_loss

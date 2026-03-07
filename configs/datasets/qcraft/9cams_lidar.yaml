@@ -16,7 +16,7 @@
 #    12   rear_50               (1024, 512)
 
 data:
-  data_root: data/qcraft/processed/training # data root for the dataset
+  data_root: /nas_thoru/users/liuzy/scene_reconstruction_data/Q3716/processed # data root for the dataset
   dataset: qcraft 
   scene_idx: 0 # which scene to use
   start_timestep: 0 # which timestep to start from
@@ -33,6 +33,7 @@ data:
     load_dynamic_mask: True # whether to load dynamic mask
     load_objects: True # whether to load object bounding boxes
     load_smpl: True # whether to load SMPL template for pedestrians
+    load_road_mask: True
     sampler: # error based image sampler
       buffer_downscale: 8 # downscale factor for the buffer wrt load_size
       buffer_ratio: 0.5 # the percentage of images sampled according to the error buffer

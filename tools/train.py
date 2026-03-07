@@ -16,9 +16,91 @@ from utils.logging_utils import MetricLogger, setup_logging
 from models.trainers.base import BasicTrainer
 from models.video_utils import render_images, save_videos
 from datasets.driving_dataset import DrivingDataset, DepthMode
+from scipy.spatial import ConvexHull
+from matplotlib.path import Path
 
 logger = logging.getLogger()
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
+
+@torch.no_grad()
+def clean_road_overhead_during_training(trainer, road_model, height_limit=0.5, grid_spacing=0.5, below_road_margin=0.5):
+    bg_model = trainer.models['Background']
+    bg_xyz = bg_model._means
+    bg_scales = bg_model.get_scaling
+    road_xyz = road_model._means
+
+    # 1. 根据路面范围计算凸包
+    road_xy_np = road_xyz[:, :2].cpu().numpy()
+    hull = ConvexHull(road_xy_np)
+    # 2.获取凸包顶点并向外扩张 0.2m (Padding)
+    vertices = road_xy_np[hull.vertices]
+    center = np.mean(vertices, axis=0)
+    expanded_vertices = vertices + (vertices - center) * 0.15 # 略微等比例外扩
+    hull_path = Path(expanded_vertices)
+
+    bg_xy_np = bg_xyz[:, :2].cpu().numpy()
+    mask_in_hull = torch.from_numpy(hull_path.contains_points(bg_xy_np)).to(bg_xyz.device)
+    
+    if not mask_in_hull.any():
+        print("without mask_in_hull! Skipping hull-based pruning, global depth pruning only.")
+
+    # 增加网格尺寸，使查找更容易匹配
+    x_min, y_min = road_xyz[:, :2].min(dim=0)[0] - 1.0
+    x_max, y_max = road_xyz[:, :2].max(dim=0)[0] + 1.0
+    
+    nx = int((x_max - x_min) / grid_spacing) + 1
+    ny = int((y_max - y_min) / grid_spacing) + 1
+    
+    # 使用 amax 记录最高路面点，保证判定上限
+    height_map = torch.full((nx, ny), -999.0, device=bg_xyz.device)
+    road_ix = ((road_xyz[:, 0] - x_min) / grid_spacing).long().clamp(0, nx - 1)
+    road_iy = ((road_xyz[:, 1] - y_min) / grid_spacing).long().clamp(0, ny - 1)
+    height_map.view(-1).scatter_reduce_(0, road_iy * nx + road_ix, road_xyz[:, 2], reduce="amax", include_self=False)
+
+    # 3. 查找与判定（仅凸包内）
+    full_kill_mask = torch.zeros(bg_xyz.shape[0], dtype=torch.bool, device=bg_xyz.device)
+    global_road_z = torch.median(road_xyz[:, 2])
+
+    if mask_in_hull.any():
+        relevant_bg_indices = torch.where(mask_in_hull)[0]
+        rel_bg_xyz = bg_xyz[relevant_bg_indices]
+        rel_bg_scales = bg_scales[relevant_bg_indices]
+
+        bg_ix = ((rel_bg_xyz[:, 0] - x_min) / grid_spacing).long().clamp(0, nx - 1)
+        bg_iy = ((rel_bg_xyz[:, 1] - y_min) / grid_spacing).long().clamp(0, ny - 1)
+        
+        local_road_z = height_map[bg_ix, bg_iy]
+
+        # 只要格子附近有路面 (valid_road_mask) 或者回退到全局路面平均高度
+        valid_road_mask = local_road_z > -900.0
+        
+        # 最终使用的参考高度：优先局部，局部没有则使用全局
+        ref_z = torch.where(valid_road_mask, local_road_z, global_road_z)
+
+        # 4. 删除条件：1）中心点在路面参考高度 + height_limit 以下，2）高斯的底部触及路面
+        bg_max_scale = rel_bg_scales.max(dim=-1)[0]
+        bg_bottom_z = rel_bg_xyz[:, 2] - bg_max_scale * 2.0 # 稍微收敛到 2 sigma
+        
+        # 条件 1: 中心点在路面限高以下 (rel_bg_xyz[:, 2] < ref_z + height_limit)
+        # 条件 2: 或者是大高斯的底部触及了路面限高 (bg_bottom_z < ref_z + height_limit)
+        local_kill_mask = (rel_bg_xyz[:, 2] < ref_z + height_limit) | \
+                            (bg_bottom_z < ref_z + height_limit)
+
+        # 5. 凸包区域剔除 mask
+        full_kill_mask[relevant_bg_indices] = local_kill_mask
+
+    # 6. 全局深度裁剪：所有背景高斯中，Z 低于路面中值 - below_road_margin 的一律删除
+    below_road_mask = bg_xyz[:, 2] < global_road_z - below_road_margin
+    num_below = below_road_mask.sum().item()
+    if num_below > 0:
+        print(f"--- [路面深度裁剪] 剔除 {num_below} 个路面以下背景高斯 "
+              f"(margin: {below_road_margin}m, road_z: {global_road_z:.2f}) ---")
+    full_kill_mask = full_kill_mask | below_road_mask
+
+    if full_kill_mask.any():
+        num_to_kill = full_kill_mask.sum().item()
+        print(f"--- [强制清理] 共剔除 {num_to_kill} 个背景高斯 (hull_limit: {height_limit}m, below_margin: {below_road_margin}m) ---")
+        bg_model.prune_points(full_kill_mask, optimizer=trainer.optimizer)
 
 def set_seeds(seed=31):
     """
@@ -154,13 +236,13 @@ def main(args):
     
     # define render keys
     render_keys = [   ## 体现在output里面的images中，每隔几k就会输出
-        "gt_rgbs",
+        # "gt_rgbs",
         "rgbs",
         "Background_rgbs",
-        "Dynamic_rgbs",
-        "RigidNodes_rgbs",
-        "DeformableNodes_rgbs",
-        "SMPLNodes_rgbs",
+        # "Dynamic_rgbs",
+        # "RigidNodes_rgbs",
+        # "DeformableNodes_rgbs",
+        # "SMPLNodes_rgbs",
         "depths",
         # "Background_depths",
         # "Dynamic_depths",
@@ -168,6 +250,8 @@ def main(args):
         # "DeformableNodes_depths",
         # "SMPLNodes_depths",
         # "mask"
+        # "gt_road_rgbs",
+        "road_rgbs"
     ]
     if cfg.render.vis_lidar:
         render_keys.insert(0, "lidar_on_images")
@@ -193,6 +277,24 @@ def main(args):
     #     render_keys=render_keys,
     #     args=args,
     # )
+
+    # NOTE(gls): Geometric Pruning for background on road prepare
+    if 'RoadNodes' in trainer.gaussian_classes:
+        road_model = trainer.models['RoadNodes']
+        road_xyz = road_model._means.detach()
+        
+        # 预计算路面包围盒信息
+        road_stats = {
+            'min_x': road_xyz[:, 0].min().item(),
+            'max_x': road_xyz[:, 0].max().item(),
+            'min_y': road_xyz[:, 1].min().item(),
+            'max_y': road_xyz[:, 1].max().item(),
+            'avg_z': road_xyz[:, 2].mean().item() # 假设路面大致平坦，取平均高度；如果有坡度，后续逻辑需要改为 KNN 
+        }
+        print(f"Road Geometry Loaded: Z~={road_stats['avg_z']:.2f}, X[{road_stats['min_x']:.1f}, {road_stats['max_x']:.1f}]")
+    else:
+        road_stats = None
+        print("Warning: Road model not found, skipping geometric pruning setup.")
 
     for step in metric_logger.log_every(all_iters, cfg.logging.print_freq):
         #----------------------------------------------------------------------------
@@ -275,6 +377,7 @@ def main(args):
             outputs=outputs,
             image_infos=image_infos,
             cam_infos=cam_infos,
+            gs=gs 
         )
         # check nan or inf
         for k, v in loss_dict.items():
@@ -287,6 +390,17 @@ def main(args):
         # after training step
         trainer.postprocess_per_train_step(step=step)
         
+        # NOTE(gls)：Geometric Pruning for background on road 
+        if 'RoadNodes' in trainer.gaussian_classes and 'Background' in trainer.gaussian_classes:
+            if step > 500 and step % 100 == 0:  #TODO(gls):100变成config超参
+                clean_road_overhead_during_training(
+                        trainer = trainer,
+                        road_model = trainer.models['RoadNodes'], # 确保 key 与你注册模型时一致
+                        height_limit = 0.5, 
+                        grid_spacing=0.15,
+                        below_road_margin=0.5
+                    )
+                torch.cuda.empty_cache() # 清理完后清理显存，防止碎片化
         #----------------------------------------------------------------------------
         #-------------------------------  logging  ----------------------------------
         with torch.no_grad():
@@ -307,7 +421,16 @@ def main(args):
         do_save = step > 0 and (
             (step % cfg.logging.saveckpt_freq == 0) or (step == trainer.num_iters)
         ) and (args.resume_from is None)
-        if do_save:  
+        if do_save:  # 保存之前再做一遍筛选
+            if 'RoadNodes' in trainer.gaussian_classes and 'Background' in trainer.gaussian_classes:
+                clean_road_overhead_during_training(
+                        trainer = trainer,
+                        road_model = trainer.models['RoadNodes'],
+                        height_limit = 0.5, 
+                        grid_spacing=0.15,
+                        below_road_margin=0.5
+                    )    
+                torch.cuda.empty_cache()
             trainer.save_checkpoint(
                 log_dir=cfg.log_dir,
                 save_only_model=True,

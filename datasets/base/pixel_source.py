@@ -117,6 +117,8 @@ class CameraData(object):
         load_dynamic_mask: bool = False,
         # whether to load the sky masks
         load_sky_mask: bool = False,
+        # whether to load the road masks
+        load_road_mask: bool = False,
         # the size to load the images
         downscale_when_loading: float = 1.0,
         # whether to undistort the images
@@ -175,16 +177,22 @@ class CameraData(object):
         if not self.novel_view_mode:
             self.load_images()
             self.load_egocar_mask()
+            self.load_ego_template()  # 加载ego模板（用于渲染新轨迹时使用）
             if load_dynamic_mask:
                 self.load_dynamic_masks()
             if load_sky_mask:
                 self.load_sky_masks()
-
             self.lidar_depth_maps = None  # will be loaded by: self.load_depth()
             self.image_error_maps = (
                 None  # will be built by: self.build_image_error_buffer()
             )
-
+        else:
+            # novel_view模式下也需要加载ego_mask和ego_template（用于新轨迹渲染）
+            self.load_egocar_mask()
+            self.load_ego_template()
+        if load_road_mask:
+            self.load_road_masks()
+        self.to(self.device)
         self.downscale_factor = 1.0
 
     @property
@@ -239,6 +247,7 @@ class CameraData(object):
         img_filepaths = []
         dynamic_mask_filepaths, sky_mask_filepaths = [], []
         human_mask_filepaths, vehicle_mask_filepaths = [], []
+        road_mask_filepaths = []
 
         fine_mask_path = os.path.join(self.data_path, "fine_dynamic_masks")
         if os.path.exists(fine_mask_path):
@@ -280,9 +289,10 @@ class CameraData(object):
                     )
                 )
                 sky_mask_filepaths.append(
-                    os.path.join(
-                        self.data_path, "sky_masks", f"{t:06d}_{self.cam_id}.png"
-                    )
+                    os.path.join(self.data_path, "sky_masks", f"{t:06d}_{self.cam_id}.png")
+                )
+                road_mask_filepaths.append(
+                    os.path.join(self.data_path, "road_masks", f"{t:06d}_{self.cam_id}.png")
                 )
             else:
                 img_filepaths.append(
@@ -328,6 +338,7 @@ class CameraData(object):
         self.human_mask_filepaths = np.array(human_mask_filepaths)
         self.vehicle_mask_filepaths = np.array(vehicle_mask_filepaths)
         self.sky_mask_filepaths = np.array(sky_mask_filepaths)
+        self.road_mask_filepaths = np.array(road_mask_filepaths)
 
     def load_images(self):
         images = []
@@ -382,6 +393,51 @@ class CameraData(object):
         else:
             self.egocar_mask = torch.zeros(self.load_size, dtype=torch.float32)
             logger.info(f"No ego car mask found for camera {self.cam_id}.")
+
+    def load_ego_template(self):
+        """
+        加载ego区域的像素模板（用于novel view渲染）
+        由于ego车身相对相机是静态的，只需加载一帧作为模板即可
+        """
+        from PIL import Image
+        import cv2
+        
+        if len(self.img_filepaths) == 0:
+            logger.warning(f"No image files available for ego template, camera {self.cam_id}")
+            self.ego_template = None
+            return
+        
+        # 使用第0帧作为ego模板
+        template_frame_idx = 0
+        img_path = self.img_filepaths[template_frame_idx]
+        
+        if not os.path.exists(img_path):
+            logger.warning(f"Ego template image not found: {img_path}")
+            self.ego_template = None
+            return
+        
+        # 加载图像
+        img = Image.open(img_path).convert("RGB")
+        # resize到加载尺寸
+        img = img.resize((self.load_size[1], self.load_size[0]), Image.BILINEAR)
+        img = np.array(img)
+        
+        # 如果需要去畸变（与训练时保持一致）
+        if self.undistort and self.intrinsics is not None:
+            img = cv2.undistort(
+                img,
+                self.intrinsics[0].cpu().numpy(),
+                self.distortions[0].cpu().numpy(),
+            )
+        
+        # 归一化到 [0, 1] 并转为tensor
+        img_tensor = torch.from_numpy(img).float() / 255.0
+        
+        # 只保留ego区域的像素（其他区域会被mask掉，这里预先相乘可以节省后续计算）
+        # ego_mask: [H, W], img_tensor: [H, W, 3]
+        self.ego_template = img_tensor * self.egocar_mask[..., None]
+        
+        logger.info(f"Loaded ego template from frame {template_frame_idx} for camera {self.cam_id}")
 
     def load_dynamic_masks(self):
         dynamic_masks = []
@@ -535,6 +591,33 @@ class CameraData(object):
         self.human_mask_filepaths = np.array(human_mask_filepaths)
         self.vehicle_mask_filepaths = np.array(vehicle_mask_filepaths)
         self.sky_mask_filepaths = np.array(sky_mask_filepaths)
+    def load_road_masks(self):
+        road_masks = []
+        try:
+            for ix, fname in tqdm(
+                enumerate(self.road_mask_filepaths),
+                desc="Loading road masks",
+                dynamic_ncols=True,
+                total=len(self.road_mask_filepaths),
+            ):
+                road_mask = Image.open(fname).convert("L")
+                # resize them to the load_size
+                road_mask = road_mask.resize(
+                    (self.load_size[1], self.load_size[0]), Image.NEAREST
+                )
+                if self.undistort:
+                    if ix == 0:
+                        print("undistorting road mask")
+                    road_mask = cv2.undistort(
+                        np.array(road_mask),
+                        self.intrinsics[ix].numpy(),
+                        self.distortions[ix].numpy(),
+                    )
+                road_masks.append(np.array(road_mask) > 0)
+        except Exception as e:
+            print(f"Error loading road masks at index {ix}: {e}")
+            raise e        
+        self.road_masks = torch.from_numpy(np.stack(road_masks, axis=0)).float()
 
     def load_depth(
         self,
@@ -616,14 +699,19 @@ class CameraData(object):
         Args:
             device: the device to move the camera to.
         """
-        self.cam_to_worlds = self.cam_to_worlds.to(device)
-        self.intrinsics = self.intrinsics.to(device)
+        """重写 to() 方法，增加 None 检查"""
+        if self.cam_to_worlds is not None:
+            self.cam_to_worlds = self.cam_to_worlds.to(device)
+        if self.intrinsics is not None:
+            self.intrinsics = self.intrinsics.to(device)
         if self.distortions is not None:
             self.distortions = self.distortions.to(device)
 
         if not self.novel_view_mode:
             self.images = self.images.to(device)
             self.egocar_mask = self.egocar_mask.to(device)
+            if hasattr(self, 'ego_template') and self.ego_template is not None:
+                self.ego_template = self.ego_template.to(device)
             if self.dynamic_masks is not None:
                 self.dynamic_masks = self.dynamic_masks.to(device)
             if self.human_masks is not None:
@@ -638,6 +726,16 @@ class CameraData(object):
                 self.lidar_depth_maps = self.lidar_depth_maps.to(device)
             if self.image_error_maps is not None:
                 self.image_error_maps = self.image_error_maps.to(device)
+        else:
+            # novel_view模式下也需要移动ego_mask和ego_template到设备
+            if hasattr(self, 'egocar_mask') and self.egocar_mask is not None:
+                self.egocar_mask = self.egocar_mask.to(device)
+            if hasattr(self, 'ego_template') and self.ego_template is not None:
+                self.ego_template = self.ego_template.to(device)
+        
+        # road_masks在两种模式下都可能存在
+        if hasattr(self, 'road_masks') and self.road_masks is not None:
+            self.road_masks = self.road_masks.to(device)
 
     def get_image(self, frame_idx: int) -> Tuple[Dict, Dict]:
         """
@@ -647,7 +745,7 @@ class CameraData(object):
         Returns:
             a dict containing the rays for rendering the given frame index.
         """
-        rgb, sky_mask = None, None
+        rgb, sky_mask, road_mask = None, None, None
         dynamic_mask, human_mask, vehicle_mask = None, None, None
         pixel_coords, normalized_time = None, None
 
@@ -701,6 +799,18 @@ class CameraData(object):
                 sky_mask = (
                     torch.nn.functional.interpolate(
                         sky_mask.unsqueeze(0).unsqueeze(0),
+                        scale_factor=self.downscale_factor,
+                        mode="nearest",
+                    )
+                    .squeeze(0)
+                    .squeeze(0)
+                )
+        if self.road_masks is not None:
+            road_mask = self.road_masks[frame_idx]
+            if self.downscale_factor != 1.0:
+                road_mask = (
+                    torch.nn.functional.interpolate(
+                        road_mask.unsqueeze(0).unsqueeze(0),
                         scale_factor=self.downscale_factor,
                         mode="nearest",
                     )
@@ -806,6 +916,7 @@ class CameraData(object):
             "frame_idx": frame_id,
             "pixels": rgb,
             "sky_masks": sky_mask,
+            "road_masks": road_mask,
             "dynamic_masks": dynamic_mask,
             "human_masks": human_mask,
             "vehicle_masks": vehicle_mask,
@@ -859,7 +970,9 @@ class ScenePixelSource(abc.ABC):
     instances_model_types: Tensor = None
     # (num_frame, num_instances)
     per_frame_instance_mask: Tensor = None
-
+    # (num_frame, )
+    per_frame_road_mask: Tensor = None
+    
     def __init__(
         self,
         dataset_name,
@@ -1311,7 +1424,7 @@ class ScenePixelSource(abc.ABC):
         original_frame_count = self.num_frames
         scaled_indices = torch.linspace(0, original_frame_count - 1, len(traj))
         normed_time = torch.linspace(0, 1, len(traj))
-
+        road_masks = camera_data.road_masks[0]
         render_data = []
         for i in range(len(traj)):
             c2w = traj[i]
@@ -1352,7 +1465,9 @@ class ScenePixelSource(abc.ABC):
                 "pixel_coords": torch.stack(
                     [y.float() / H, x.float() / W], dim=-1
                 ),  # [H, W, 2]
-                # "egocar_masks": camera_data.egocar_mask,
+                "egocar_masks": camera_data.egocar_mask,  # ego车身mask
+                "pixels": camera_data.ego_template,  # ego区域模板（所有帧共用）
+                "road_masks": road_masks,
             }
 
             render_data.append(

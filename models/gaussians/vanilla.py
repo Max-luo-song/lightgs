@@ -472,3 +472,45 @@ class VanillaGaussians(nn.Module):
             "positions": means[mask],
             "colors": direct_color[mask],
         }
+
+    def prune_points(self, mask: torch.Tensor, optimizer: torch.optim.Optimizer = None) -> None:
+            """
+            从外部强制剔除指定的高斯点。
+            Args:
+                mask: torch.Tensor (bool), 形状为 [num_points], True 表示要剔除的点。
+                optimizer: 当前的优化器。如果传入，将同步清理优化器状态。
+            """
+            if not mask.any():
+                return
+
+            # 确保是布尔型
+                if mask.dtype != torch.bool:
+                    mask = mask.to(torch.bool)
+
+            n_bef = self.num_points
+            # 这里的 ~mask 表示保留下来的点
+            keep_mask = ~mask
+
+            # 1. 更新模型参数
+            self._means = Parameter(self._means[keep_mask].detach())
+            self._scales = Parameter(self._scales[keep_mask].detach())
+            self._quats = Parameter(self._quats[keep_mask].detach())
+            self._features_dc = Parameter(self._features_dc[keep_mask].detach())
+            self._features_rest = Parameter(self._features_rest[keep_mask].detach())
+            self._opacities = Parameter(self._opacities[keep_mask].detach())
+
+            # 2. 同步更新内部统计量 (非常重要，否则 postprocess 会报错)
+            if self.xys_grad_norm is not None:
+                self.xys_grad_norm = self.xys_grad_norm[keep_mask]
+            if hasattr(self, 'vis_counts') and self.vis_counts is not None:
+                self.vis_counts = self.vis_counts[keep_mask]
+            if self.max_2Dsize is not None:
+                self.max_2Dsize = self.max_2Dsize[keep_mask]
+
+            # 3. 同步更新优化器状态
+            if optimizer is not None:
+                param_groups = self.get_gaussian_param_groups()
+                # 使用你框架中现有的 remove_from_optim 工具函数
+                # 注意：mask 必须是布尔类型且长度与剔除前一致
+                remove_from_optim(optimizer, mask, param_groups)
+            print(f"     [Online Pruning] Class {self.class_prefix} removed: {n_bef - self.num_points} points.")

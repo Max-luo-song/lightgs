@@ -21,7 +21,7 @@ python datasets/preprocess.py \
     --skip_front_wide_side_cameras # --scene_ids $scene_id \
 
 # step 2: extract mask
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source ${SCRIPT_DIR}/utils.sh
 source /opt/conda/etc/profile.d/conda.sh && conda activate mmseg2
 

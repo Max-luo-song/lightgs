@@ -9,6 +9,8 @@ log_file="$(dirname "$0")/train_results.txt"  # 与脚本同目录
 echo "训练开始时间: $(date)" > "$log_file"  # 清空文件并写入开始时间
 echo "场景ID, 状态, 时间" >> "$log_file"    # 添加标题行
 ################################################################################
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source ${SCRIPT_DIR}/utils.sh
 # Pick an avaliable gpu
 # source scripts/utils.sh
 # if [ "${gpu}" = "-1" ]; then

@@ -31,17 +31,18 @@ def get_numpy(x: Tensor) -> np.ndarray:
 
 
 def non_zero_mean(x: Tensor) -> float:
+    # 过滤掉 Infinity 和 NaN 值
+    x = [v for v in x if np.isfinite(v)]
     return float(sum(x) / len(x) if len(x) > 0 else -1)
 
 
-def compute_psnr(prediction: Tensor, target: Tensor, eps: float = 1e-10) -> float:
+def compute_psnr(prediction: Tensor, target: Tensor) -> float:
     """
     Computes the Peak Signal-to-Noise Ratio (PSNR) between the prediction and target tensors.
 
     Args:
         prediction (torch.Tensor): The predicted tensor.
         target (torch.Tensor): The target tensor.
-        eps (float): 1e-10 make max(psnr)<=100.
 
     Returns:
         float: The PSNR value between the prediction and target tensors.
@@ -50,7 +51,7 @@ def compute_psnr(prediction: Tensor, target: Tensor, eps: float = 1e-10) -> floa
         prediction = Tensor(prediction)
     if not isinstance(target, Tensor):
         target = Tensor(target).to(prediction.device)
-    return (-10 * torch.log10(F.mse_loss(prediction, target) + eps)).item()
+    return (-10 * torch.log10(F.mse_loss(prediction, target))).item()
 
 
 def render_images(

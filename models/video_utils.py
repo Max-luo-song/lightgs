@@ -31,8 +31,6 @@ def get_numpy(x: Tensor) -> np.ndarray:
 
 
 def non_zero_mean(x: Tensor) -> float:
-    # 过滤掉 Infinity 和 NaN 值
-    x = [v for v in x if np.isfinite(v)]
     return float(sum(x) / len(x) if len(x) > 0 else -1)
 
 

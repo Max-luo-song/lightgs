@@ -1467,6 +1467,8 @@ def save_seperate_images(
                 continue
 
         cam_names = render_results["cam_names"]
+        cam_ids = render_results["cam_ids"]
+
         # skip if the key is not in render_results
         if "mask" in key:
             new_key = key.replace("mask", "opacities")
@@ -1499,7 +1501,7 @@ def save_seperate_images(
 
         for j, frame in enumerate(frames):
             imageio.imwrite(
-                img_save_pth.replace(".png", f"/{timestamps:06d}_{j:03d}.png"),
+                img_save_pth.replace(".png", f"/{timestamps:06d}_{cam_ids[j]:03d}.png"),
                 to8b(frame),
             )
         tiled_img = layout(frames, cam_names)

@@ -301,11 +301,11 @@ def match_and_postprocess(
         }
         
     # collect data
-    for cam_id in camera_list:
+    for idx, cam_id in enumerate(camera_list):
         parsed_pred_track = parsed_pred_track_all[cam_id]
         parsed_gt_track = parsed_gt_track_all[cam_id]
         _matches = match_gt2pred[cam_id]
-        
+
         if len(_matches) > 0:
             # collect 2DBox_appear_mask
             for gt_tid in valid_gt_tids:
@@ -313,10 +313,10 @@ def match_and_postprocess(
                     continue
                 for fi in range(num_f):
                     if parsed_gt_track[gt_tid]["valids"][fi]:
-                        collector[gt_tid]["2DBox_appear_mask"][cam_id, fi] = 1
+                        collector[gt_tid]["2DBox_appear_mask"][idx, fi] = 1
                         box = parsed_gt_track[gt_tid]["tracked_bbox"][fi]
-                        collector[gt_tid]["area"][cam_id, fi] = box[2] * box[3]
-            
+                        collector[gt_tid]["area"][idx, fi] = box[2] * box[3]
+
             # collect SMPL data
             for gt_tid in valid_gt_tids:
                 if gt_tid not in parsed_gt_track:
@@ -326,11 +326,11 @@ def match_and_postprocess(
                     continue
                 for fi in range(num_f):
                     if parsed_gt_track[gt_tid]["valids"][fi] and parsed_pred_track[matched_pred_tid]["valids"][fi]:
-                        collector[gt_tid]["smpl"]["global_orient"][cam_id, fi] = parsed_pred_track[matched_pred_tid]["smpl"]["global_orient"][fi].clone()
-                        collector[gt_tid]["smpl"]["body_pose"][cam_id, fi] = parsed_pred_track[matched_pred_tid]["smpl"]["body_pose"][fi].clone()
-                        collector[gt_tid]["smpl"]["betas"][cam_id, fi] = parsed_pred_track[matched_pred_tid]["smpl"]["betas"][fi].clone()
-                        collector[gt_tid]["camera"][cam_id, fi] = parsed_pred_track[matched_pred_tid]["camera"][fi].clone()
-                        collector[gt_tid]["matched_mask"][cam_id, fi] = 1
+                        collector[gt_tid]["smpl"]["global_orient"][idx, fi] = parsed_pred_track[matched_pred_tid]["smpl"]["global_orient"][fi].clone()
+                        collector[gt_tid]["smpl"]["body_pose"][idx, fi] = parsed_pred_track[matched_pred_tid]["smpl"]["body_pose"][fi].clone()
+                        collector[gt_tid]["smpl"]["betas"][idx, fi] = parsed_pred_track[matched_pred_tid]["smpl"]["betas"][fi].clone()
+                        collector[gt_tid]["camera"][idx, fi] = parsed_pred_track[matched_pred_tid]["camera"][fi].clone()
+                        collector[gt_tid]["matched_mask"][idx, fi] = 1
         
     # update valid mask
     for gt_tid in valid_gt_tids:
@@ -342,7 +342,7 @@ def match_and_postprocess(
     
     # Save matched data in a format compatible with 4D-Humans visualization
     if save_temp:
-        for cam_id in camera_list:
+        for idx, cam_id in enumerate(camera_list):
             pkl_dict = {}
             for fi in range(num_f):
                 fi_info = {
@@ -356,15 +356,15 @@ def match_and_postprocess(
                     "camera": [],
                 }
                 for gt_tid in valid_gt_tids:
-                    if collector[gt_tid]["valid_mask"][cam_id, fi]:
+                    if collector[gt_tid]["valid_mask"][idx, fi]:
                         fi_info["tid"].append(gt_tid)
                         fi_info["tracked_time"].append(0)
                         fi_info["smpl"].append({
-                            "global_orient": collector[gt_tid]["smpl"]["global_orient"][cam_id, fi].numpy(),
-                            "body_pose": collector[gt_tid]["smpl"]["body_pose"][cam_id, fi].numpy(),
-                            "betas": collector[gt_tid]["smpl"]["betas"][cam_id, fi].numpy(),
+                            "global_orient": collector[gt_tid]["smpl"]["global_orient"][idx, fi].numpy(),
+                            "body_pose": collector[gt_tid]["smpl"]["body_pose"][idx, fi].numpy(),
+                            "betas": collector[gt_tid]["smpl"]["betas"][idx, fi].numpy(),
                         })
-                        fi_info["camera"].append(collector[gt_tid]["camera"][cam_id, fi].numpy())
+                        fi_info["camera"].append(collector[gt_tid]["camera"][idx, fi].numpy())
                 pkl_dict[fi] = fi_info
             joblib.dump(
                 pkl_dict, os.path.join(temp_dir, f"{cam_id}_matched.pkl")
@@ -588,15 +588,24 @@ def match_and_postprocess(
                 pkl_dict, os.path.join(temp_dir, f"{cam_id}_merged.pkl")
             )
     
-    # pop out 2DBox_appear_mask and selected_cam_idx and camera
+    # pop out 2DBox_appear_mask and camera, selected_cam_idx map 0~num_c-1 to camera_list[0~num_c-1]
     for gt_tid in valid_gt_tids:
         merged_collector[gt_tid].pop("2DBox_appear_mask")
         merged_collector[gt_tid].pop("camera")
+        # Convert camera position index to actual camera ID
+        # Keep -1 unchanged, only map 0~num_c-1 to camera_list[0~num_c-1]
+        selected_cam_idx = merged_collector[gt_tid]["selected_cam_idx"]
+        valid_mask = merged_collector[gt_tid]["valid_mask"]
+        if valid_mask.any():
+            selected_cam_idx[valid_mask] = torch.tensor(
+                [camera_list[idx.item()] for idx in selected_cam_idx[valid_mask]],
+                dtype=torch.long
+            )
         
     # check if nan or inf in smpl, for debug use
     for gt_tid in valid_gt_tids:
         for k, v in merged_collector[gt_tid]["smpl"].items():
             if v.isnan().any() or v.isinf().any():
                 raise ValueError(f"gt_tid {gt_tid} has nan or inf in {k}")
-    
+
     return merged_collector

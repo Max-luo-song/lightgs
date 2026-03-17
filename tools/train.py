@@ -391,16 +391,16 @@ def main(args):
         trainer.postprocess_per_train_step(step=step)
         
         # NOTE(gls)：Geometric Pruning for background on road 
-        if 'RoadNodes' in trainer.gaussian_classes and 'Background' in trainer.gaussian_classes:
-            if step > 500 and step % 100 == 0:  #TODO(gls):100变成config超参
-                clean_road_overhead_during_training(
-                        trainer = trainer,
-                        road_model = trainer.models['RoadNodes'], # 确保 key 与你注册模型时一致
-                        height_limit = 0.5, 
-                        grid_spacing=0.15,
-                        below_road_margin=0.5
-                    )
-                torch.cuda.empty_cache() # 清理完后清理显存，防止碎片化
+        # if 'RoadNodes' in trainer.gaussian_classes and 'Background' in trainer.gaussian_classes:
+        #     if step > 500 and step % 100 == 0:  #TODO(gls):100变成config超参
+        #         clean_road_overhead_during_training(
+        #                 trainer = trainer,
+        #                 road_model = trainer.models['RoadNodes'], # 确保 key 与你注册模型时一致
+        #                 height_limit = 0.5, 
+        #                 grid_spacing=0.15,
+        #                 below_road_margin=0.5
+        #             )
+        #         torch.cuda.empty_cache() # 清理完后清理显存，防止碎片化
         #----------------------------------------------------------------------------
         #-------------------------------  logging  ----------------------------------
         with torch.no_grad():
@@ -422,15 +422,15 @@ def main(args):
             (step % cfg.logging.saveckpt_freq == 0) or (step == trainer.num_iters)
         ) and (args.resume_from is None)
         if do_save:  # 保存之前再做一遍筛选
-            if 'RoadNodes' in trainer.gaussian_classes and 'Background' in trainer.gaussian_classes:
-                clean_road_overhead_during_training(
-                        trainer = trainer,
-                        road_model = trainer.models['RoadNodes'],
-                        height_limit = 0.5, 
-                        grid_spacing=0.15,
-                        below_road_margin=0.5
-                    )    
-                torch.cuda.empty_cache()
+            # if 'RoadNodes' in trainer.gaussian_classes and 'Background' in trainer.gaussian_classes:
+            #     clean_road_overhead_during_training(
+            #             trainer = trainer,
+            #             road_model = trainer.models['RoadNodes'],
+            #             height_limit = 0.5, 
+            #             grid_spacing=0.15,
+            #             below_road_margin=0.5
+            #         )    
+            #     torch.cuda.empty_cache()
             trainer.save_checkpoint(
                 log_dir=cfg.log_dir,
                 save_only_model=True,

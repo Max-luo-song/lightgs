@@ -9,6 +9,14 @@ from utils.geometry import uniform_sample_sphere
 
 logger = logging.getLogger()
 
+import os
+from utils.misc import export_points_to_ply, import_str
+
+DEBUG_PCD = False
+if DEBUG_PCD:
+    DEBUG_OUTPUT_DIR = "debug"
+    os.makedirs(DEBUG_OUTPUT_DIR, exist_ok=True)
+
 class MultiTrainer(BasicTrainer):
     def __init__(
         self,
@@ -26,6 +34,8 @@ class MultiTrainer(BasicTrainer):
         # gaussian model classes
         if "Background" in self.model_config:
             self.gaussian_classes["Background"] = GSModelType.Background
+        if "RoadNodes" in self.model_config:
+            self.gaussian_classes['RoadNodes'] = GSModelType.RoadNodes
         if "RigidNodes" in self.model_config:
             self.gaussian_classes["RigidNodes"] = GSModelType.RigidNodes
         if "SMPLNodes" in self.model_config:
@@ -126,6 +136,10 @@ class MultiTrainer(BasicTrainer):
             model = self.models[class_name]
             
             empty = False
+
+            # NOTE(gls): 路面点云依赖于背景点云，因此路面点云和背景点云获取都放在Background中
+            # 背景点云获取：雷达随机采样+去除动态box+远近随机初始化+过滤地面节点+过滤地面以下节点
+            # 地面点云获取：雷达随机采样+去除动态box+提取地面节点(雷达点云pmf & road mask)
             if class_name == 'Background':                
                 # ------ initialize gaussians ------
                 init_cfg = model_cfg.pop('init')
@@ -138,7 +152,59 @@ class MultiTrainer(BasicTrainer):
                     print("without from lidar!")
                     sampled_pts, sampled_color, sampled_time = \
                         torch.empty(0, 3).to(self.device), torch.empty(0, 3).to(self.device), None
+
+                if DEBUG_PCD:
+                    export_points_to_ply(
+                        sampled_pts,
+                        sampled_color,
+                        save_path=os.path.join(DEBUG_OUTPUT_DIR, "lidar_samples_pts.ply"),
+                    )
+
+                processed_pts_wo_box = dataset.project_aggregated_lidar_pts_wo_box(
+                    delete_out_of_view_points=True
+                )
+                if DEBUG_PCD:
+                    export_points_to_ply(
+                        processed_pts_wo_box["pts"],
+                        processed_pts_wo_box["colors"],
+                        save_path=os.path.join(DEBUG_OUTPUT_DIR, "lidar_samples_wo_box_pts.ply"),
+                    )        
+                # 点云分割类型：LIDAR (PMF算法) / IMAGE (相机road_mask) / LIDAR_AND_IMAGE (两者结合, 效果最佳)
+                SEG_TYPE = init_cfg.get("seg_road_type", "LIDAR")
+                if SEG_TYPE == "LIDAR":
+                    processed_init_wo_road_pts, processed_init_road_pts = dataset.filter_pts_in_road( 
+                        seed_pts=processed_pts_wo_box["pts"],
+                        seed_colors=processed_pts_wo_box["colors"],
+                        TYPE = "LIDAR",
+                        road_only= True
+                    )
+                elif SEG_TYPE == "IMAGE":
+                    processed_init_wo_road_pts, processed_init_road_pts = dataset.filter_pts_in_road( 
+                        seed_pts=processed_pts_wo_box["pts"],
+                        seed_colors=processed_pts_wo_box["colors"],
+                        TYPE = "IMAGE",
+                        road_only = True
+                    )
+                elif SEG_TYPE == "LIDAR_AND_IMAGE":
+                    processed_init_wo_road_pts, processed_init_road_pts = dataset.filter_pts_in_road(
+                        seed_pts=processed_pts_wo_box["pts"],
+                        seed_colors=processed_pts_wo_box["colors"],
+                        TYPE = "LIDAR_AND_IMAGE",
+                        road_only = True
+                    )
                 
+                if DEBUG_PCD:
+                    export_points_to_ply(
+                        processed_init_wo_road_pts["pts"],
+                        processed_init_wo_road_pts["colors"],
+                        save_path=os.path.join(DEBUG_OUTPUT_DIR, "lidar_samples_wo_box_wo_road_pts.ply"),
+                    )
+                    export_points_to_ply(
+                        processed_init_road_pts["pts"],
+                        processed_init_road_pts["colors"],
+                        save_path=os.path.join(DEBUG_OUTPUT_DIR, "lidar_samples_wo_box_road_pts.ply"),
+                    )
+
                 random_pts = []
                 num_near_pts = init_cfg.get('near_randoms', 0)
                 if num_near_pts > 0: # uniformly sample points inside the scene's sphere
@@ -157,17 +223,36 @@ class MultiTrainer(BasicTrainer):
                     
                     sampled_pts = torch.cat([sampled_pts, valid_pts], dim=0)
                     sampled_color = torch.cat([sampled_color, torch.rand(valid_pts.shape, ).to(self.device)], dim=0)
-                
+    
+                #NOTE(gls): 背景点云方式是先去掉物体box内的点云，再去掉路面点云及以下，剩下的点云作为背景初始化点云
                 processed_init_pts = dataset.filter_pts_in_boxes(
                     seed_pts=sampled_pts,
                     seed_colors=sampled_color,
                     valid_instances_dict=allnode_pts_dict
+                )   
+                processed_env_init_pts, _ = dataset.filter_pts_in_road(
+                    seed_pts=processed_init_pts["pts"],
+                    seed_colors=processed_init_pts["colors"],
+                    TYPE = SEG_TYPE,
+                    road_only = False
                 )
-                
+
+                if DEBUG_PCD:
+                    export_points_to_ply(
+                        processed_env_init_pts["pts"],
+                        processed_env_init_pts["colors"],
+                        save_path=os.path.join(DEBUG_OUTPUT_DIR, "env_init_pts.ply"),
+                    )
                 model.create_from_pcd(
-                    init_means=processed_init_pts["pts"], init_colors=processed_init_pts["colors"]
+                    init_means=processed_env_init_pts["pts"], init_colors=processed_env_init_pts["colors"]
                 )
-                
+
+            if class_name == "RoadNodes":
+                model.create_from_pcd(
+                    init_means=processed_init_road_pts["pts"], init_colors=processed_init_road_pts["colors"]
+                )
+                logger.info(f"RoadNodes Initialized Finish!")
+
             if class_name == 'RigidNodes':
                 empty = self.safe_init_models(
                     model=model,
@@ -249,10 +334,52 @@ class MultiTrainer(BasicTrainer):
             image_ids=image_infos["img_idx"].flatten()[0],
             novel_view=novel_view
         )
-        gs = self.collect_gaussians(
+
+
+        # NOTE(gls): 封锁RoadNode的xyz梯度,freeze_mask为路面部分的高斯mask
+        gs, freeze_mask = self.collect_gaussians( # NOTE(gls): fix some road gaussian xyz by road mask 注意冻结的路面是true 需要区分出哪些是路面的高斯
             cam=processed_cam,
             image_ids=image_infos["img_idx"].flatten()[0],
         )
+        # 强制设为 True,这是注册钩子的前提条件
+        gs.means.requires_grad_(True)
+        gs.quats.requires_grad_(True)
+        gs.scales.requires_grad_(True)
+        gs.opacities.requires_grad_(True)
+
+        def zero_grad_for_road(grad): # grad (N, 3)
+            # freeze_mask 是 True 的位置是路面，想把这些位置的梯度清零
+            # ~freeze_mask 是 True 的位置是非路面，这些位置的梯度保持不变, 作为掩码来保留非路面的梯度
+            inverted_mask = ~freeze_mask
+            mask_float = inverted_mask.float()[..., None] # mask_float (N, 1)
+            return grad * mask_float
+
+        params_to_register = {
+            'means': gs.means,
+            'quats': gs.quats,
+            # 'scales': gs.scales,  # 尺度用另外一个钩子函数限制z
+            # 'opacities': gs.opacities  # 透明度放宽
+        }
+
+        for name, param in params_to_register.items():
+            # 检查是否已经注册过（通过在 gs 对象上打标记）
+            attr_name = f'road_freeze_hook_registered_{name}'
+            if not hasattr(gs, attr_name):
+                param.register_hook(zero_grad_for_road)
+                # 标记为已注册
+                setattr(gs, attr_name, True)
+
+        def scale_grad_hook(grad):
+            # 只针对路面部分 (freeze_mask == True) 进行处理
+            new_grad = grad.clone()
+            # 将路面高斯的 z 轴梯度 (index 2) 设为 0, 同时保留路面高斯的 x, y 轴梯度
+            new_grad[freeze_mask, 2] = 0.0 
+            return new_grad
+
+        # 在初始化或 collect_gaussians 后注册
+        gs.scales.register_hook(scale_grad_hook)
+        attr_name_scales = f'road_freeze_hook_registered_scales'
+        setattr(gs, attr_name_scales, True)
 
         # render gaussians
         outputs, render_fn = self.render_gaussians(
@@ -273,7 +400,12 @@ class MultiTrainer(BasicTrainer):
         outputs["rgb"] = self.affine_transformation(
             outputs["rgb_gaussians"] + outputs["rgb_sky"] * (1.0 - outputs["opacity"]), image_infos
         )
-        
+
+        # NOTE(gls): 对output['rgb']增加一个road mask，然后把路面独立出来
+        road_mask = image_infos["road_masks"]
+        outputs['road_rgb'] = outputs['rgb'] * road_mask[..., None]
+        outputs["freeze_mask"] = freeze_mask # 带回路面标注
+
         if not self.training and self.render_each_class:
             with torch.no_grad():
                 for class_name in self.gaussian_classes.keys():
@@ -290,16 +422,16 @@ class MultiTrainer(BasicTrainer):
                 outputs["Dynamic_rgb"] = self.affine_transformation(sep_rgb, image_infos)
                 outputs["Dynamic_opacity"] = sep_opacity
                 outputs["Dynamic_depth"] = sep_depth
-        
-        return outputs
+        return outputs, gs
 
     def compute_losses(
         self,
         outputs: Dict[str, torch.Tensor],
         image_infos: Dict[str, torch.Tensor],
         cam_infos: Dict[str, torch.Tensor],
+        gs
     ) -> Dict[str, torch.Tensor]:
-        loss_dict = super().compute_losses(outputs, image_infos, cam_infos)
+        loss_dict = super().compute_losses(outputs, image_infos, cam_infos, gs)
         return loss_dict
     
     def compute_metrics(

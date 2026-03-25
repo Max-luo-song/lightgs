@@ -29,6 +29,8 @@ trainer:
       inverse_depth: False # whether to use inverse depth, NOTE that when set to True, must normalize=True
       normalize: False # whether to normalize depth loss
       loss_type: l1 # choose from ["l1", "l2"]
+    road:
+      w: 1
     affine:
       w: 0.00001 # weight of affine regularization
   res_schedule:
@@ -66,6 +68,7 @@ trainer:
     stop_screen_size_at: 5000     # stop culling/splitting at this step WRT screen size of gaussians
     stop_split_at: 20000          # stop splitting at this step
     sh_degree: 3                  # sh degree for gaussians
+    road_sh_degree: 1
 
 # ------------- Model ------------ #
 model:
@@ -77,6 +80,7 @@ model:
         return_color: True
       near_randoms: 100_000
       far_randoms: 100_000
+      seg_road_type: LIDAR_AND_IMAGE # [LIDAR, IMAGE, LIDAR_AND_IMAGE]
     reg:
       sharp_shape_reg:
         w: 1.
@@ -219,6 +223,13 @@ model:
       ins_translation:
         lr: 0.0005
         lr_final: 0.0001
+  RoadNodes:
+    type: models.nodes.RoadNodes
+    init:
+      from_lidar: True
+    reg:
+      from_lidar: True
+      lowest_opacity: 0.2
   SMPLNodes: 
     type: models.nodes.SMPLNodes
     init:

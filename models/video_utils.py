@@ -770,6 +770,7 @@ def render(
         SMPLNodes_rgbs,
         Dynamic_rgbs,
     ) = ([], [], [], [], [])
+    road_rgbs, gt_road_rgbs = [], []
     error_maps = []
 
     # depths
@@ -803,6 +804,7 @@ def render(
         human_psnrs, human_ssims = [], []
         vehicle_psnrs, vehicle_ssims = [], []
         occupied_psnrs, occupied_ssims = [], []
+        road_psnrs, road_ssims = [], []
 
     with torch.no_grad():
         indices = vis_indices if vis_indices is not None else range(len(dataset))
@@ -817,7 +819,7 @@ def render(
                 if isinstance(v, Tensor):
                     cam_infos[k] = v.cuda(non_blocking=True)
             # render the image
-            results = trainer(image_infos, cam_infos)
+            results, _ = trainer(image_infos, cam_infos)
 
             # ------------- clip rgb ------------- #
             for k, v in results.items():
@@ -835,6 +837,21 @@ def render(
             rgbs.append(get_numpy(rgb))
             if "pixels" in image_infos:
                 gt_rgbs.append(get_numpy(image_infos["pixels"]))
+
+
+            if "road_masks" in image_infos:
+                if "egocar_masks" in image_infos:
+                    # in the case of egocar, we need to mask out the egocar region
+                    valid_loss_mask = (1.0 - image_infos["egocar_masks"]).float()
+                else:
+                    valid_loss_mask = torch.ones_like(image_infos["sky_masks"])
+                road_mask = image_infos["road_masks"]
+
+                gt_road_rgb = image_infos["pixels"] * valid_loss_mask[..., None] * road_mask[..., None]
+                gt_road_rgbs.append(get_numpy(gt_road_rgb))
+                road_rgb = results["road_rgb"]
+                road_rgb = road_rgb * valid_loss_mask[..., None]
+                road_rgbs.append(get_numpy(road_rgb))
 
             green_background = torch.tensor([0.0, 177, 64]) / 255.0
             green_background = green_background.to(rgb.device)
@@ -1123,6 +1140,10 @@ def render(
         results_dict["opacities"] = opacities
     if len(gt_rgbs) > 0:
         results_dict["gt_rgbs"] = gt_rgbs
+    if len(gt_road_rgbs) > 0:
+        results_dict["gt_road_rgbs"] = gt_road_rgbs
+    if len(road_rgbs) > 0:
+        results_dict["road_rgbs"] = road_rgbs
     if len(error_maps) > 0:
         results_dict["rgb_error_maps"] = error_maps
     if len(rgb_sky_blend) > 0:
@@ -1183,6 +1204,75 @@ def save_images(
         verbose=verbose,
     )
     return return_frame
+
+
+def save_seperate_images(
+    render_results: Dict[str, List[Tensor]],
+    save_pth: str,
+    layout: Callable,
+    timestamps: int,
+    keys: List[str] = ["gt_rgbs", "rgbs", "depths"],
+    verbose: bool = False,
+):
+    return_frame_dict = {}
+    for key in keys:
+        video_save_pth = save_pth.replace(".mp4", f"_{key}_layout.mp4")
+        img_save_pth = save_pth.replace(".mp4", f"_{key}.png")
+        if not os.path.exists(img_save_pth.replace(".png", "")):
+            os.makedirs(img_save_pth.replace(".png", ""), exist_ok=True) 
+        if not os.path.exists(video_save_pth.replace(".mp4", "")):
+            os.makedirs(video_save_pth.replace(".mp4", ""), exist_ok=True) 
+
+        if "mask" not in key:
+            if key not in render_results or len(render_results[key]) == 0:
+                continue
+
+        cam_names = render_results["cam_names"]
+        # skip if the key is not in render_results
+        if "mask" in key:
+            new_key = key.replace("mask", "opacities")
+            if new_key not in render_results or len(render_results[new_key]) == 0:
+                continue
+            frames = render_results[new_key]
+        else:
+            if key not in render_results or len(render_results[key]) == 0:
+                continue
+            frames = render_results[key]
+        # convert to rgb if necessary
+        if key == "gt_sky_masks":
+            frames = [np.stack([frame, frame, frame], axis=-1) for frame in frames]
+        elif "mask" in key:
+            frames = [np.stack([frame, frame, frame], axis=-1) for frame in frames]
+        elif "depth" in key:
+            try:
+                opacities = render_results[key.replace("depths", "opacities")]
+            except:
+                if "median" in key:
+                    opacities = render_results[
+                        key.replace("median_depths", "opacities")
+                    ]
+                else:
+                    continue
+            frames = [
+                depth_visualizer(frame, opacity)
+                for frame, opacity in zip(frames, opacities)
+            ]
+
+        for j, frame in enumerate(frames):
+            imageio.imwrite(
+                img_save_pth.replace(".png", f"/{timestamps:06d}_{j:03d}.png"),
+                to8b(frame),
+            )
+        tiled_img = layout(frames, cam_names)
+        tiled_img = to8b(tiled_img)
+        video_save_pth = video_save_pth.replace(".mp4", f"/{timestamps:06d}.png")
+        imageio.imwrite(
+            video_save_pth,
+            tiled_img,
+        )
+        return_frame_dict[key] = tiled_img
+    del render_results
+    return return_frame_dict
 
 
 def save_videos(
@@ -1246,7 +1336,7 @@ def render_novel_views(
                 frame_data["image_infos"][key] = value.cuda(non_blocking=True)
 
             # Perform rendering
-            outputs = trainer(
+            outputs, _ = trainer(
                 image_infos=frame_data["image_infos"],
                 camera_infos=frame_data["cam_infos"],
                 novel_view=True,
@@ -1258,9 +1348,27 @@ def render_novel_views(
                     outputs[k] = v.clamp(0.0, 1.0)
 
             rgb = get_numpy(outputs["rgb"])
+            ### NOTE(gls): 增加ego_mask原始
+            image_infos = frame_data["image_infos"]
+            if "egocar_masks" in image_infos and "pixels" in image_infos:
+                # 使用ego模板混合：非ego区域使用渲染结果，ego区域使用原始图像模板
+                rgb_tensor = outputs["rgb"]  # 新轨迹渲染的RGB
+                ego_mask = image_infos["egocar_masks"][..., None]  # [H, W, 1]
+                ego_template = image_infos["pixels"]  # ego区域模板 [H, W, 3]
+                
+                # 混合：非ego区域=新渲染，ego区域=原始模板
+                rgb_tensor = rgb_tensor * (1 - ego_mask) + ego_template * ego_mask
+                rgb = get_numpy(rgb_tensor)
+            
             depth = get_numpy(outputs["depth"])
+            ### NOTE(gls): 增加ego_mask区域，深度设置为极端颜色
+            if "egocar_masks" in image_infos:
+                depth_tensor = outputs["depth"]
+                ego_mask = image_infos["egocar_masks"][..., None]
+                depth_tensor = depth_tensor * (1 - ego_mask) + 200.0 * ego_mask
+                depth = get_numpy(depth_tensor)
+            
             opacity = get_numpy(outputs["opacity"]) if "opacity" in outputs else None
-
             # 恢复畸变图像
             # NOTE(syc): 是否不只针对鱼眼相机？
             if camera_data.is_fisheye:

@@ -183,6 +183,10 @@ class HMR2_4dhuman(PHALP):
     def setup_hmr(self):
         self.HMAR = HMR2023TextureSampler(self.cfg)
 
+    def setup_visualizer(self):
+        if self.cfg.render.enable:
+            super().setup_visualizer()
+
     def get_detections(self, image, frame_name, t_, additional_data=None, measurments=None):
         (
             pred_bbox, pred_bbox, pred_masks, pred_scores, pred_classes, 

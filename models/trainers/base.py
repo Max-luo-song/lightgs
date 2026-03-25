@@ -389,6 +389,7 @@ class BasicTrainer(nn.Module):
         self,
         cam: dataclass_camera,
         image_ids: torch.Tensor, # leave it here for future use
+        global_sh_coeffs: torch.Tensor = None
     ) -> dataclass_gs:
         gs_dict = {
             "_means": [],
@@ -399,7 +400,11 @@ class BasicTrainer(nn.Module):
             "class_labels": [],
         }
         for class_name in self.gaussian_classes.keys():
-            gs = self.models[class_name].get_gaussians(cam)
+            try:
+                gs = self.models[class_name].get_gaussians(cam, global_sh_coeffs=global_sh_coeffs)
+            except TypeError:
+                gs = self.models[class_name].get_gaussians(cam)
+
             if gs is None:
                 continue
     

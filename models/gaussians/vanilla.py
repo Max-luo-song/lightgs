@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 from torch.nn import Parameter
 
+import torch.nn.functional as F
 from models.gaussians.basics import *
 
 logger = logging.getLogger()
@@ -52,6 +53,7 @@ class VanillaGaussians(nn.Module):
         self.device = device
         self.ball_gaussians=self.ctrl_cfg.get("ball_gaussians", False)
         self.gaussian_2d = self.ctrl_cfg.get("gaussian_2d", False)
+        self.use_pbr = self.ctrl_cfg.get("use_pbr", False)
         
         # for evaluation
         self.in_test_set = False
@@ -71,7 +73,24 @@ class VanillaGaussians(nn.Module):
         self._opacities = torch.zeros(1, 1, device=self.device)
         self._features_dc = torch.zeros(1, 3, device=self.device)
         self._features_rest = torch.zeros(1, num_sh_bases(self.sh_degree) - 1, 3, device=self.device)
-        
+
+        if self.use_pbr:
+            # PBR attributes
+            self._roughness = torch.zeros(1, 1, device=self.device)
+            self._metallic = torch.zeros(1, 1, device=self.device)
+            self._normals = torch.zeros(1, 3, device=self.device)
+            # ASG attributes (4 lobes)
+            # Amplitude (3 RGB), Sharpness (2 lambda,mu), Direction (2 theta,phi or 3 xyz)
+            # Paper: "Each Gaussian is assigned a small set of ASG lobes (four in our case)"
+            # Simplified: 1 lobe for now to check feasibility or 4? Let's use 1 to start.
+            # No, let's follow the paper "four in our case".
+            self.num_asg_lobes = 4
+            self._asg_amplitude = torch.zeros(1, self.num_asg_lobes, 3, device=self.device)
+            self._asg_sharpness = torch.zeros(1, self.num_asg_lobes, 2, device=self.device) 
+            # Directions can be local or global. Assuming local to normal?
+            # Or explicit directions.
+            self._asg_dir = torch.zeros(1, self.num_asg_lobes, 3, device=self.device)
+
     @property
     def sh_degree(self):
         return self.ctrl_cfg.sh_degree
@@ -103,6 +122,19 @@ class VanillaGaussians(nn.Module):
         self._features_dc = Parameter(shs[:, 0, :])
         self._features_rest = Parameter(shs[:, 1:, :])
         self._opacities = Parameter(torch.logit(0.1 * torch.ones(self.num_points, 1, device=self.device)))
+        
+        if self.use_pbr:
+            # Initialize PBR params
+            self._roughness = Parameter(torch.logit(0.5 * torch.ones(self.num_points, 1, device=self.device)))
+            self._metallic = Parameter(torch.logit(0.5 * torch.ones(self.num_points, 1, device=self.device)))
+            # Initialize normals (random or from somewhere? For now random)
+            self._normals = Parameter(F.normalize(torch.randn(self.num_points, 3, device=self.device), dim=-1))
+            
+            # ASG params
+            self._asg_amplitude = Parameter(torch.logit(0.1 * torch.ones(self.num_points, self.num_asg_lobes, 3, device=self.device)))
+            self._asg_sharpness = Parameter(torch.logit(0.5 * torch.ones(self.num_points, self.num_asg_lobes, 2, device=self.device)))
+            self._asg_dir = Parameter(F.normalize(torch.randn(self.num_points, self.num_asg_lobes, 3, device=self.device), dim=-1))
+
         
     @property
     def colors(self):
@@ -191,7 +223,7 @@ class VanillaGaussians(nn.Module):
             )
         
     def get_gaussian_param_groups(self) -> Dict[str, List[Parameter]]:
-        return {
+        groups = {
             self.class_prefix+"xyz": [self._means],
             self.class_prefix+"sh_dc": [self._features_dc],
             self.class_prefix+"sh_rest": [self._features_rest],
@@ -199,6 +231,14 @@ class VanillaGaussians(nn.Module):
             self.class_prefix+"scaling": [self._scales],
             self.class_prefix+"rotation": [self._quats],
         }
+        if self.use_pbr:
+            groups[self.class_prefix+"roughness"] = [self._roughness]
+            groups[self.class_prefix+"metallic"] = [self._metallic]
+            groups[self.class_prefix+"normals"] = [self._normals]
+            groups[self.class_prefix+"asg_amplitude"] = [self._asg_amplitude]
+            groups[self.class_prefix+"asg_sharpness"] = [self._asg_sharpness]
+            groups[self.class_prefix+"asg_dir"] = [self._asg_dir]
+        return groups
     
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         return self.get_gaussian_param_groups()
@@ -230,28 +270,32 @@ class VanillaGaussians(nn.Module):
                     splits |= (self.max_2Dsize > self.ctrl_cfg.split_screen_size).squeeze()
                 splits &= high_grads
                 nsamps = self.ctrl_cfg.n_split_samples
-                (
-                    split_means,
-                    split_feature_dc,
-                    split_feature_rest,
-                    split_opacities,
-                    split_scales,
-                    split_quats,
-                ) = self.split_gaussians(splits, nsamps)
+                
+                if self.use_pbr:
+                    (
+                        split_means, split_feature_dc, split_feature_rest, split_opacities, split_scales, split_quats,
+                        split_roughness, split_metallic, split_normals, split_asg_amplitude, split_asg_sharpness, split_asg_dir
+                    ) = self.split_gaussians(splits, nsamps)
+                else:
+                    (
+                        split_means, split_feature_dc, split_feature_rest, split_opacities, split_scales, split_quats,
+                    ) = self.split_gaussians(splits, nsamps)
 
                 dups = (
                     self.get_scaling.max(dim=-1).values <= \
                         self.ctrl_cfg.densify_size_thresh * self.scene_scale
                 ).squeeze()
                 dups &= high_grads
-                (
-                    dup_means,
-                    dup_feature_dc,
-                    dup_feature_rest,
-                    dup_opacities,
-                    dup_scales,
-                    dup_quats,
-                ) = self.dup_gaussians(dups)
+                
+                if self.use_pbr:
+                    (
+                        dup_means, dup_feature_dc, dup_feature_rest, dup_opacities, dup_scales, dup_quats,
+                        dup_roughness, dup_metallic, dup_normals, dup_asg_amplitude, dup_asg_sharpness, dup_asg_dir
+                    ) = self.dup_gaussians(dups)
+                else:
+                    (
+                        dup_means, dup_feature_dc, dup_feature_rest, dup_opacities, dup_scales, dup_quats,
+                    ) = self.dup_gaussians(dups)
                 
                 self._means = Parameter(torch.cat([self._means.detach(), split_means, dup_means], dim=0))
                 # self.colors_all = Parameter(torch.cat([self.colors_all.detach(), split_colors, dup_colors], dim=0))
@@ -260,6 +304,14 @@ class VanillaGaussians(nn.Module):
                 self._opacities = Parameter(torch.cat([self._opacities.detach(), split_opacities, dup_opacities], dim=0))
                 self._scales = Parameter(torch.cat([self._scales.detach(), split_scales, dup_scales], dim=0))
                 self._quats = Parameter(torch.cat([self._quats.detach(), split_quats, dup_quats], dim=0))
+                
+                if self.use_pbr:
+                    self._roughness = Parameter(torch.cat([self._roughness.detach(), split_roughness, dup_roughness], dim=0))
+                    self._metallic = Parameter(torch.cat([self._metallic.detach(), split_metallic, dup_metallic], dim=0))
+                    self._normals = Parameter(torch.cat([self._normals.detach(), split_normals, dup_normals], dim=0))
+                    self._asg_amplitude = Parameter(torch.cat([self._asg_amplitude.detach(), split_asg_amplitude, dup_asg_amplitude], dim=0))
+                    self._asg_sharpness = Parameter(torch.cat([self._asg_sharpness.detach(), split_asg_sharpness, dup_asg_sharpness], dim=0))
+                    self._asg_dir = Parameter(torch.cat([self._asg_dir.detach(), split_asg_dir, dup_asg_dir], dim=0))
                 
                 # append zeros to the max_2Dsize tensor
                 self.max_2Dsize = torch.cat(
@@ -294,9 +346,12 @@ class VanillaGaussians(nn.Module):
                 for group in optimizer.param_groups:
                     if group["name"] == self.class_prefix+"opacity":
                         old_params = group["params"][0]
-                        param_state = optimizer.state[old_params]
-                        param_state["exp_avg"] = torch.zeros_like(param_state["exp_avg"])
-                        param_state["exp_avg_sq"] = torch.zeros_like(param_state["exp_avg_sq"])
+                        if old_params in optimizer.state:
+                            param_state = optimizer.state[old_params]
+                            if "exp_avg" in param_state:
+                                param_state["exp_avg"] = torch.zeros_like(param_state["exp_avg"])
+                            if "exp_avg_sq" in param_state:
+                                param_state["exp_avg_sq"] = torch.zeros_like(param_state["exp_avg_sq"])
             self.xys_grad_norm = None
             self.vis_counts = None
             self.max_2Dsize = None
@@ -326,6 +381,14 @@ class VanillaGaussians(nn.Module):
         self._features_dc = Parameter(self._features_dc[~culls].detach())
         self._features_rest = Parameter(self._features_rest[~culls].detach())
         self._opacities = Parameter(self._opacities[~culls].detach())
+        
+        if self.use_pbr:
+            self._roughness = Parameter(self._roughness[~culls].detach())
+            self._metallic = Parameter(self._metallic[~culls].detach())
+            self._normals = Parameter(self._normals[~culls].detach())
+            self._asg_amplitude = Parameter(self._asg_amplitude[~culls].detach())
+            self._asg_sharpness = Parameter(self._asg_sharpness[~culls].detach())
+            self._asg_dir = Parameter(self._asg_dir[~culls].detach())
 
         print(f"     Cull: {n_bef - self.num_points}")
         return culls
@@ -358,6 +421,17 @@ class VanillaGaussians(nn.Module):
         self._scales[split_mask] = torch.log(torch.exp(self._scales[split_mask]) / size_fac)
         # step 5, sample new quats
         new_quats = self._quats[split_mask].repeat(samps, 1)
+
+        if self.use_pbr:
+            new_roughness = self._roughness[split_mask].repeat(samps, 1)
+            new_metallic = self._metallic[split_mask].repeat(samps, 1)
+            new_normals = self._normals[split_mask].repeat(samps, 1)
+            new_asg_amplitude = self._asg_amplitude[split_mask].repeat(samps, 1, 1)
+            new_asg_sharpness = self._asg_sharpness[split_mask].repeat(samps, 1, 1)
+            new_asg_dir = self._asg_dir[split_mask].repeat(samps, 1, 1)
+            return new_means, new_feature_dc, new_feature_rest, new_opacities, new_scales, new_quats, \
+                   new_roughness, new_metallic, new_normals, new_asg_amplitude, new_asg_sharpness, new_asg_dir
+                   
         return new_means, new_feature_dc, new_feature_rest, new_opacities, new_scales, new_quats
 
     def dup_gaussians(self, dup_mask: torch.Tensor) -> Tuple:
@@ -373,22 +447,90 @@ class VanillaGaussians(nn.Module):
         dup_opacities = self._opacities[dup_mask]
         dup_scales = self._scales[dup_mask]
         dup_quats = self._quats[dup_mask]
+
+        if self.use_pbr:
+            dup_roughness = self._roughness[dup_mask]
+            dup_metallic = self._metallic[dup_mask]
+            dup_normals = self._normals[dup_mask]
+            dup_asg_amplitude = self._asg_amplitude[dup_mask]
+            dup_asg_sharpness = self._asg_sharpness[dup_mask]
+            dup_asg_dir = self._asg_dir[dup_mask]
+            return dup_means, dup_feature_dc, dup_feature_rest, dup_opacities, dup_scales, dup_quats, \
+                   dup_roughness, dup_metallic, dup_normals, dup_asg_amplitude, dup_asg_sharpness, dup_asg_dir
+
         return dup_means, dup_feature_dc, dup_feature_rest, dup_opacities, dup_scales, dup_quats
 
-    def get_gaussians(self, cam: dataclass_camera) -> Dict:
+    def compute_pbr_color(self, cam, global_sh_coeffs):
+        # Albedo
+        albedo = torch.sigmoid(self._features_dc) # Base color
+        
+        # Normals
+        normals = F.normalize(self._normals, dim=-1)
+        
+        # View directions
+        viewdirs = self._means.detach() - cam.camtoworlds.data[..., :3, 3]
+        viewdirs = -F.normalize(viewdirs, dim=-1) # Point to camera
+        
+        # Diffuse Component (Ld)
+        if global_sh_coeffs is not None:
+             # Evaluate SH at normals
+             # global_sh_coeffs: [1, (deg+1)^2, 3] or [B, ...]
+             sh_coeffs_expanded = global_sh_coeffs.unsqueeze(0).expand(self.num_points, -1, -1)
+             
+             num_coeffs = global_sh_coeffs.shape[-2]
+             global_sh_degree = int(num_coeffs ** 0.5) - 1
+             
+             diffuse_light = spherical_harmonics(global_sh_degree, normals, sh_coeffs_expanded)
+             diffuse_light = torch.clamp(diffuse_light, 0.0)
+             L_d = albedo * diffuse_light
+        else:
+             L_d = albedo * 0.1 # Fallback ambient
+             
+        # Specular Component (Ls) - Simplified
+        # Iterate over lobes
+        L_s = torch.zeros_like(L_d)
+        
+        # ASG Params
+        asg_amp = torch.sigmoid(self._asg_amplitude)
+        asg_sharp = torch.exp(self._asg_sharpness) # lambda, mu
+        asg_dir = F.normalize(self._asg_dir, dim=-1)
+        
+        for i in range(self.num_asg_lobes):
+            l_i = asg_dir[:, i, :] # Light direction
+            h_i = F.normalize(viewdirs + l_i, dim=-1)
+            ndoth = torch.clamp((normals * h_i).sum(dim=-1, keepdim=True), 0.0, 1.0)
+            
+            # Simple Phong approx for now
+            roughness = torch.sigmoid(self._roughness)
+            shininess = 1.0 / (roughness + 1e-6)
+            spec = torch.pow(ndoth, shininess * 10.0) 
+            
+            L_s += asg_amp[:, i, :] * spec
+
+        L_HDR = L_d + L_s
+        
+        # Tone Mapping
+        L_LDR = L_HDR / (1.0 + L_HDR)
+        
+        return L_LDR
+
+    def get_gaussians(self, cam: dataclass_camera, global_sh_coeffs: torch.Tensor = None) -> Dict:
         filter_mask = torch.ones_like(self._means[:, 0], dtype=torch.bool)
         self.filter_mask = filter_mask
         
         # get colors of gaussians
-        colors = torch.cat((self._features_dc[:, None, :], self._features_rest), dim=1)
-        if self.sh_degree > 0:
-            viewdirs = self._means.detach() - cam.camtoworlds.data[..., :3, 3]  # (N, 3)
-            viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
-            n = min(self.step // self.ctrl_cfg.sh_degree_interval, self.sh_degree)
-            rgbs = spherical_harmonics(n, viewdirs, colors)
-            rgbs = torch.clamp(rgbs + 0.5, 0.0, 1.0)
+        if self.use_pbr:
+            rgbs = self.compute_pbr_color(cam, global_sh_coeffs)
         else:
-            rgbs = torch.sigmoid(colors[:, 0, :])
+            colors = torch.cat((self._features_dc[:, None, :], self._features_rest), dim=1)
+            if self.sh_degree > 0:
+                viewdirs = self._means.detach() - cam.camtoworlds.data[..., :3, 3]  # (N, 3)
+                viewdirs = viewdirs / viewdirs.norm(dim=-1, keepdim=True)
+                n = min(self.step // self.ctrl_cfg.sh_degree_interval, self.sh_degree)
+                rgbs = spherical_harmonics(n, viewdirs, colors)
+                rgbs = torch.clamp(rgbs + 0.5, 0.0, 1.0)
+            else:
+                rgbs = torch.sigmoid(colors[:, 0, :])
             
         activated_opacities = self.get_opacity
         activated_scales = self.get_scaling

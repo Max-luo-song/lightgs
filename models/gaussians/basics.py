@@ -167,7 +167,17 @@ def remove_from_optim(optimizer, deleted_mask, param_dict):
             old_params = group["params"][0]
             new_params = param_dict[name]
             assert len(new_params) == 1
+            
+            # Ensure optimizer state exists for old_params
+            if old_params not in optimizer.state:
+                optimizer.state[old_params] = {}
             param_state = optimizer.state[old_params]
+            
+            if "exp_avg" not in param_state:
+                param_state["exp_avg"] = torch.zeros_like(old_params.data)
+            if "exp_avg_sq" not in param_state:
+                param_state["exp_avg_sq"] = torch.zeros_like(old_params.data)
+                
             del optimizer.state[old_params]
 
             # Modify the state directly without deleting and reassigning.
@@ -180,6 +190,9 @@ def remove_from_optim(optimizer, deleted_mask, param_dict):
             optimizer.param_groups[group_idx]["params"] = new_params
             optimizer.state[new_params[0]] = param_state
 
+import torch
+from torch import nn
+
 def dup_in_optim(optimizer, dup_mask, param_dict, n=2):
     """adds the parameters to the optimizer"""
     for group_idx, group in enumerate(optimizer.param_groups):
@@ -187,7 +200,17 @@ def dup_in_optim(optimizer, dup_mask, param_dict, n=2):
         if name in param_dict.keys():
             old_params = group["params"][0]
             new_params = param_dict[name]
+            
+            # Ensure optimizer state exists for old_params
+            if old_params not in optimizer.state:
+                optimizer.state[old_params] = {}
             param_state = optimizer.state[old_params]
+            
+            if "exp_avg" not in param_state:
+                param_state["exp_avg"] = torch.zeros_like(old_params.data)
+            if "exp_avg_sq" not in param_state:
+                param_state["exp_avg_sq"] = torch.zeros_like(old_params.data)
+                
             repeat_dims = (n,) + tuple(1 for _ in range(param_state["exp_avg"].dim() - 1))
             param_state["exp_avg"] = torch.cat(
                 [param_state["exp_avg"], torch.zeros_like(param_state["exp_avg"][dup_mask.squeeze()]).repeat(*repeat_dims)],

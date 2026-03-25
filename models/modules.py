@@ -199,8 +199,66 @@ class EnvLight(torch.nn.Module):
 
         light = dr.texture(self.base[None, ...], l, filter_mode='linear', boundary_mode='cube')
         light = light.view(*prefix, -1)
-
         return light
+
+    def get_param_groups(self):
+        return {
+            self.class_prefix+"all": self.parameters(),
+        }
+
+class GlobalLightingModule(nn.Module):
+    def __init__(
+        self,
+        class_name: str,
+        n: int, # n_cameras
+        sh_degree: int = 2,
+        hidden_dim: int = 64,
+        num_layers: int = 8,
+        appearance_embedding_dim: int = 16,
+        device: torch.device = torch.device("cuda")
+    ):
+        super().__init__()
+        self.class_prefix = class_name + "#"
+        self.device = device
+        self.sh_degree = sh_degree
+        self.num_sh_coeffs = (self.sh_degree + 1) ** 2
+        self.output_dim = 3 * self.num_sh_coeffs # 3 channels (RGB) * SH coeffs
+
+        # Embedding for normalized timestamp (scalar -> vector)
+        # Or just concatenate scalar time? Paper says "conditioned on normalized timestep and camera embeddings"
+        # Let's use sinusoidal encoding for time.
+        self.time_encoding = SinusoidalEncoder(n_input_dims=1, min_deg=0, max_deg=4)
+        
+        # Appearance/Camera embedding
+        self.appearance_embedding_dim = appearance_embedding_dim
+        self.appearance_embedding = nn.Embedding(n, appearance_embedding_dim)
+
+        in_dims = self.time_encoding.n_output_dims + self.appearance_embedding_dim
+        
+        self.mlp = MLP(
+            in_dims=in_dims,
+            out_dims=self.output_dim,
+            num_layers=num_layers,
+            hidden_dims=hidden_dim,
+            skip_connections=[num_layers // 2]
+        )
+
+    def forward(self, normalized_time, camera_idx):
+        # normalized_time: [B, 1]
+        # camera_idx: [B] or [B, 1]
+        
+        time_emb = self.time_encoding(normalized_time)
+        cam_emb = self.appearance_embedding(camera_idx)
+        if cam_emb.dim() > time_emb.dim():
+            cam_emb = cam_emb.squeeze(1)
+        
+        x = torch.cat([time_emb, cam_emb], dim=-1)
+        sh_coeffs = self.mlp(x)
+        
+        # Reshape to [B, 3, (sh_degree+1)^2]
+        # Or [B, (sh_degree+1)^2, 3] to match SH convention?
+        # Convention in 3DGS is typically [..., SH_DIM, 3]
+        return sh_coeffs.reshape(-1, self.num_sh_coeffs, 3)
 
     def get_param_groups(self):
         return {

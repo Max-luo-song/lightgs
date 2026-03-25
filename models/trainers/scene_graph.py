@@ -45,8 +45,11 @@ class MultiTrainer(BasicTrainer):
         if "TrafficLightNodes" in self.model_config:
             self.gaussian_classes["TrafficLightNodes"] = GSModelType.TrafficLightNodes
            
+        self.misc_classes_keys.append("GlobalLighting") # Add GlobalLighting
+
         for class_name, model_cfg in self.model_config.items():
             # update model config for gaussian classes
+
             if class_name in self.gaussian_classes:
                 model_cfg = self.model_config.pop(class_name)
                 self.model_config[class_name] = self.update_gaussian_cfg(model_cfg)
@@ -337,9 +340,17 @@ class MultiTrainer(BasicTrainer):
 
 
         # NOTE(gls): 封锁RoadNode的xyz梯度,freeze_mask为路面部分的高斯mask
+        global_sh_coeffs = None
+        if "GlobalLighting" in self.models:
+            normed_time = image_infos["normed_time"].flatten()[0].view(1, 1) # [1, 1]
+            cam_idx = image_infos["img_idx"].flatten()[0].view(1) # [1]
+            global_sh_coeffs = self.models["GlobalLighting"](normed_time, cam_idx)
+            global_sh_coeffs = global_sh_coeffs.squeeze(0) # [K, 3]
+
         gs, freeze_mask = self.collect_gaussians( # NOTE(gls): fix some road gaussian xyz by road mask 注意冻结的路面是true 需要区分出哪些是路面的高斯
             cam=processed_cam,
             image_ids=image_infos["img_idx"].flatten()[0],
+            global_sh_coeffs=global_sh_coeffs
         )
         # 强制设为 True,这是注册钩子的前提条件
         gs.means.requires_grad_(True)

@@ -601,6 +601,21 @@ class VanillaGaussians(nn.Module):
         self._features_dc = Parameter(torch.zeros((N,) + self._features_dc.shape[1:], device=self.device))
         self._features_rest = Parameter(torch.zeros((N,) + self._features_rest.shape[1:], device=self.device))
         self._opacities = Parameter(torch.zeros((N,) + self._opacities.shape[1:], device=self.device))
+
+        if self.use_pbr:
+            if "_roughness" in state_dict:
+                self._roughness = Parameter(torch.zeros((N,) + self._roughness.shape[1:], device=self.device))
+            if "_metallic" in state_dict:
+                self._metallic = Parameter(torch.zeros((N,) + self._metallic.shape[1:], device=self.device))
+            if "_normals" in state_dict:
+                self._normals = Parameter(torch.zeros((N,) + self._normals.shape[1:], device=self.device))
+            if "_asg_amplitude" in state_dict:
+                self._asg_amplitude = Parameter(torch.zeros((N,) + self._asg_amplitude.shape[1:], device=self.device))
+            if "_asg_sharpness" in state_dict:
+                self._asg_sharpness = Parameter(torch.zeros((N,) + self._asg_sharpness.shape[1:], device=self.device))
+            if "_asg_dir" in state_dict:
+                self._asg_dir = Parameter(torch.zeros((N,) + self._asg_dir.shape[1:], device=self.device))
+
         msg = super().load_state_dict(state_dict, **kwargs)
         return msg
     
@@ -640,6 +655,14 @@ class VanillaGaussians(nn.Module):
             self._features_dc = Parameter(self._features_dc[keep_mask].detach())
             self._features_rest = Parameter(self._features_rest[keep_mask].detach())
             self._opacities = Parameter(self._opacities[keep_mask].detach())
+
+            if self.use_pbr:
+                self._roughness = Parameter(self._roughness[keep_mask].detach())
+                self._metallic = Parameter(self._metallic[keep_mask].detach())
+                self._normals = Parameter(self._normals[keep_mask].detach())
+                self._asg_amplitude = Parameter(self._asg_amplitude[keep_mask].detach())
+                self._asg_sharpness = Parameter(self._asg_sharpness[keep_mask].detach())
+                self._asg_dir = Parameter(self._asg_dir[keep_mask].detach())
 
             # 2. 同步更新内部统计量 (非常重要，否则 postprocess 会报错)
             if self.xys_grad_norm is not None:

@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Quick validation training script (A/B friendly)
+# Usage examples:
+#   bash scripts/qcraft/trian.shg
+#   GPU=0 NUM_ITERS=22000 bash scripts/qcraft/trian.shg
+#   RESUME_FROM=output/.../checkpoint_20000.pth CONFIG_FILE=configs/xxx.yaml bash scripts/qcraft/trian.shg
+
+################################################################################
+# Base settings (override with env vars if needed)
+################################################################################
+gpu="${GPU:--1}"
+
+scene_idx="${SCENE_IDX:-20250819_004633_Q3707_990_1010_part01}"
+camera_ids_str="${CAMERA_IDS:-0 1 2 3 5 6 7 9 10 11 12}"
+read -r -a camera_ids <<< "${camera_ids_str}"
+lidar_type="${LIDAR_TYPE:-lidar}"                       # lidar / visual
+
+config_file="${CONFIG_FILE:-configs/omnire_extended_cam_lidar.yaml}"
+dataset_config="${DATASET_CONFIG:-qcraft/11cams_${lidar_type}}"
+variant_tag="${VARIANT_TAG:-quickval}"
+
+# Quick validation window:
+# Resume from an existing checkpoint and run only a short tail.
+resume_from="${RESUME_FROM:-output/qcraft_20250819_004633_Q3707_990_1010_part01/20260401_lidar+cam0_1_2_3_5_6_7_9_10_11_12lightgsv2/checkpoint_20000.pth}"
+num_iters="${NUM_ITERS:-22000}"                         # only +2000 steps from ckpt_20000
+
+# Optional frame window for faster iteration (set END_TIMESTEP=-1 for full range)
+start_timestep="${START_TIMESTEP:-0}"
+end_timestep="${END_TIMESTEP:--1}"
+
+# Logging/checkpoint frequency for quick diagnosis
+print_freq="${PRINT_FREQ:-50}"
+vis_freq="${VIS_FREQ:-500}"
+saveckpt_freq="${SAVECKPT_FREQ:-500}"
+################################################################################
+
+source scripts/utils.sh
+if [ "${gpu}" = "-1" ]; then
+    gpu="$(pick_gpu)"
+    if [ -z "${gpu}" ]; then
+        echo "no gpu found"
+        exit 1
+    fi
+fi
+echo "Using GPU: ${gpu}"
+
+if [ ! -f "${resume_from}" ]; then
+    echo "resume checkpoint not found: ${resume_from}"
+    exit 1
+fi
+
+output_root="output"
+project_name="qcraft_${scene_idx}"
+
+date_str="$(date +%Y%m%d)"
+run_name="${date_str}_${lidar_type}+cam$(IFS="_"; echo "${camera_ids[*]}")${variant_tag}"
+run_dir="${output_root}/${project_name}/${run_name}"
+
+if [ -d "${run_dir}" ]; then
+    echo "error: ${run_dir} already exists. Please change VARIANT_TAG or remove dir manually."
+    exit 1
+fi
+mkdir -p "${run_dir}"
+
+script_name="$(basename "$0")"
+cp "$0" "${run_dir}/${script_name}"
+
+echo "============================================================"
+echo "Quick validation run"
+echo "config_file   : ${config_file}"
+echo "resume_from   : ${resume_from}"
+echo "num_iters     : ${num_iters}"
+echo "dataset       : ${dataset_config}"
+echo "scene_idx     : ${scene_idx}"
+echo "camera_ids    : ${camera_ids[*]}"
+echo "timestep range: [${start_timestep}, ${end_timestep}]"
+echo "run_dir       : ${run_dir}"
+echo "============================================================"
+
+export PYTHONPATH="$(pwd)"
+CUDA_VISIBLE_DEVICES="${gpu}" python tools/train.py \
+    --config_file "${config_file}" \
+    --output_root "${output_root}" \
+    --project "${project_name}" \
+    --run_name "${run_name}" \
+    --resume_from "${resume_from}" \
+    dataset="${dataset_config}" \
+    data.scene_idx="${scene_idx}" \
+    data.pixel_source.cameras="[$(IFS=','; echo "${camera_ids[*]}")]" \
+    data.start_timestep="${start_timestep}" \
+    data.end_timestep="${end_timestep}" \
+    trainer.optim.num_iters="${num_iters}" \
+    logging.print_freq="${print_freq}" \
+    logging.vis_freq="${vis_freq}" \
+    logging.saveckpt_freq="${saveckpt_freq}"
+
+echo "Done. Run dir: ${run_dir}"

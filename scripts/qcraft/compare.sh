@@ -9,11 +9,11 @@
 
 # 第一个训练结果的日志目录（旧结果）
 # log_dir1="${1:-}"
-log_dir1="output/qcraft_20251025_163358_QCOYSD504206_1595_1610/cam_0_1_2_3_5_6_7_9_10_11_12"
+log_dir1="output/qcraft_20250819_004633_Q3707_990_1010_part01/20260327_lidar+cam0_1_2_3_5_6_7_9_10_11_12lightgs_origin"
 
 # 第二个训练结果的日志目录（新结果）
 # log_dir2="${2:-}"
-log_dir2="output/qcraft_20251025_163358_QCOYSD504206_1595_1610/cam_0_1_2_3_6_7_10_11_12_wo_depth_loss"
+log_dir2="output/qcraft_20250819_004633_Q3707_990_1010_part01/20260325_lidar+cam0_1_2_3_5_6_7_9_10_11_12lightgs"
 
 # wandb 配置
 enable_wandb=false

@@ -906,6 +906,9 @@ class CameraData(object):
         origins = origins.reshape(img_height, img_width, 3)
         viewdirs = viewdirs.reshape(img_height, img_width, 3)
         direction_norm = direction_norm.reshape(img_height, img_width, 1)
+        # Get image file path for depth estimation
+        img_path = self.img_filepaths[frame_idx] if hasattr(self, 'img_filepaths') else None
+        
         _image_infos = {
             "origins": origins,
             "viewdirs": viewdirs,
@@ -922,6 +925,7 @@ class CameraData(object):
             "vehicle_masks": vehicle_mask,
             "egocar_masks": egocar_mask,
             "lidar_depth_map": lidar_depth_map,
+            "img_path": img_path,
         }
         image_infos = {k: v for k, v in _image_infos.items() if v is not None}
 

@@ -1,0 +1,249 @@
+seed: 0
+dataset: waymo/3cams
+
+# ============================================================================
+# Anti-Floater PBR Configuration
+# 
+# This configuration enables comprehensive floater (foggy Gaussian) detection
+# and removal, along with depth-based constraints for cleaner scene rendering.
+# 
+# Three-Phase Implementation:
+# - Phase 1: Floater detection + spatial sparsity (quick wins)
+# - Phase 2: Depth consistency + surface-guided densification
+# - Phase 3: Surface-supported emissive Gaussians for bright radiance
+# ============================================================================
+
+# ------------- Trainer ------------ #
+trainer:
+  type: models.trainers.MultiTrainer
+  optim:
+    num_iters: 30000
+    use_grad_scaler: false
+    cache_buffer_freq: -1 
+  render:
+    near_plane: 0.1 
+    far_plane: 10000000000.0 
+    antialiased: false 
+    packed: false 
+    absgrad: true 
+    sparse_grad: false 
+    batch_size: 1 
+  losses:
+    rgb:
+      w: 0.8
+    ssim:
+      w: 0.2
+    mask:
+      w: 0.05
+      opacity_loss_type: bce 
+    depth:
+      w: 0.01 
+      inverse_depth: False 
+      normalize: False 
+      loss_type: l1 
+    free_space:
+      enabled: true
+      w: 0.02
+      margin: 0.5
+      opacity_power: 1.0
+      opacity_floor: 0.0
+      mask_dynamic: true
+      non_road_only: false
+      bright_region_reweight: true
+      bright_luma_thresh: 0.9
+      bright_weight: 0.5
+      rear_camera_ids: [6, 7, 10, 11, 12]
+      rear_camera_weight: 1.5
+      rear_pseudo_enabled: true
+      rear_pseudo_weight: 0.2
+      rear_pseudo_margin: 0.6
+      rear_pseudo_max_lidar_ratio: 0.02
+      rear_pseudo_min_depth: 0.5
+      rear_pseudo_max_depth: 80.0
+      rear_pseudo_mask_sky: true
+      rear_pseudo_grad_confidence: true
+      rear_pseudo_grad_scale: 2.0
+      rear_pseudo_conf_min: 0.05
+    affine:
+      w: 0.00001 
+  res_schedule:
+    double_steps: 250 
+    downscale_times: 2 
+  gaussian_optim_general_cfg:
+    xyz:
+      lr: 1.6e-04
+      lr_final: 1.6e-06
+      scale_factor: scene_radius 
+    sh_dc:
+      lr: 0.0025
+    sh_rest:
+      lr: 0.000125
+    opacity:
+      lr: 0.05
+    scaling:
+      lr: 0.005
+    rotation:
+      lr: 0.001
+    # PBR Parameters
+    roughness:
+      lr: 0.001
+    metallic:
+      lr: 0.001
+    normals:
+      lr: 0.001
+    asg_amplitude:
+      lr: 0.001
+    asg_sharpness:
+      lr: 0.001
+    asg_dir:
+      lr: 0.001
+    # Emissive Parameters (Phase 3)
+    emissive:
+      lr: 0.001
+    emissive_intensity:
+      lr: 0.001
+      
+  gaussian_ctrl_general_cfg:
+    warmup_steps: 50             
+    reset_alpha_interval: 3000    
+    refine_interval: 100          
+    sh_degree_interval: 1000      
+    n_split_samples: 2            
+    reset_alpha_value: 0.01       
+    densify_grad_thresh: 0.0005   
+    densify_size_thresh: 0.003    
+    cull_alpha_thresh: 0.005      
+    cull_scale_thresh: 0.5        
+    cull_screen_size: 0.15        
+    split_screen_size: 0.05       
+    stop_screen_size_at: 4000     
+    stop_split_at: 15000          
+    sh_degree: 3                  
+
+# ------------- Model ------------ #
+model:
+  Background:
+    type: models.gaussians.VanillaGaussians
+    init:
+      from_lidar:
+        num_samples: 100000
+        return_color: True
+      near_randoms: 5000
+      far_randoms: 5000
+    ctrl:
+      use_pbr: True
+      use_emissive: True  # Phase 3: Enable emissive Gaussians
+      
+      # ========== Depth Estimator Configuration ==========
+      depth_estimator:
+        encoder: vitl           # Depth Anything V2 encoder (vits, vitb, vitl)
+        max_depth: 80           # Maximum depth in meters
+        cache_dir: null         # Optional: cache directory for depth maps
+        max_cache_items: 100    # Max items in memory cache
+      
+      # ========== Phase 1: Floater Detection ==========
+      floater_detection:
+        enabled: True
+        grad_thresh: 0.0001      # Low gradient activity threshold
+        opacity_thresh: 0.1      # Low opacity threshold
+        isolation_thresh: 2.0    # Spatial isolation threshold (scene units)
+        depth_margin: 1.0        # Max distance from depth surface (meters)
+        soft_prune_until: 10000  # Use soft pruning until this step
+        hard_prune_interval: 1000 # Hard prune every N steps after soft_prune_until
+        warmup_steps: 500        # Don't prune before this step
+        floater_score_thresh: 0.7 # Score threshold for floater classification
+      
+      # ========== Phase 2: Surface-Guided Densification ==========
+      surface_guided_densification:
+        enabled: True
+        pull_factor: 0.5         # How much to pull split Gaussians toward surface
+        max_dup_distance: 1.0    # Max distance from surface for clone to be valid (meters)
+        
+    reg:
+      # Original regularization
+      sharp_shape_reg:
+        w: 1.
+        step_interval: 10
+        max_gauss_ratio: 10.
+      
+      # ========== Phase 1: Spatial Sparsity ==========
+      spatial_sparsity:
+        enabled: True
+        w: 0.01                  # Loss weight
+        grid_size: 1.0           # Voxel size for grouping
+        max_density: 10.0        # Max gaussians per unit opacity
+        distance_scale: 2.0      # Scale for distance weighting
+      
+      # ========== Phase 2: Depth Consistency ==========
+      depth_consistency:
+        w: 0.1                   # Loss weight
+        max_surface_distance: 0.5 # Max distance from depth surface (meters)
+        use_ray_consistency: True # Use ray-based consistency
+      
+      # ========== Phase 3: Emissive Sparsity ==========
+      emissive_sparsity:
+        w: 0.01                  # Penalize excessive emissive points
+  
+  GlobalLighting:
+    type: models.modules.GlobalLightingModule
+    params:
+      sh_degree: 2
+      hidden_dim: 64
+      num_layers: 4
+      appearance_embedding_dim: 16
+    optim:
+      all:
+        lr: 0.001
+        
+  Sky:
+    type: models.modules.EnvLight
+    params:
+      resolution: 1024
+    optim:
+      all:
+        lr: 0.01
+        
+  Affine:
+    type: models.modules.AffineTransform
+    params:
+      embedding_dim: 4
+      base_mlp_layer_width: 64
+      pixel_affine: False
+    optim:
+      all:
+        lr: 1.0e-5
+        weight_decay: 1.0e-6
+        
+  CamPose:
+    type: models.modules.CameraOptModule
+    optim:
+      all:
+        lr: 1.0e-5
+        weight_decay: 1.0e-6
+
+# ------------- Depth Estimation ------------ #
+depth_estimation:
+  enabled: True
+  model: depth_anything_v2
+  encoder: vitl           # vits, vitb, vitl
+  mode: metric            # metric or relative
+  dataset: vkitti         # vkitti for outdoor, hypersim for indoor
+  max_depth: 80.0         # meters
+  precompute: True        # Precompute depth maps for all training images
+  cache_dir: null         # Auto-determined if null
+
+# ------------- render ------------ #
+render:
+  fps: 10 
+  render_full: True 
+  render_test: True 
+  vis_lidar: False 
+  vis_sky: False 
+  vis_error: False 
+
+# ------------- logging ------------ #
+logging:
+  vis_freq: 100 
+  print_freq: 10 
+  saveckpt_freq: 1000 
+  save_seperate_video: True 

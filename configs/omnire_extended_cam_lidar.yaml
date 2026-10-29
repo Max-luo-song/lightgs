@@ -16,9 +16,63 @@ trainer:
     absgrad: true # whether to use absolute gradient for rendering, supported by gsplat kernel
     sparse_grad: false # whether to use sparse gradient for rendering, supported by gsplat kernel
     batch_size: 1 # batch size for rendering, currently only support 1
+    camera_flare:
+      enabled: true
+      start_iter: 12000
+      camera_ids: [6, 7, 10, 11, 12]
+      core_luma_thresh: 0.70
+      core_power: 1.5
+      vertical_size: 121
+      vertical_decay: 22.0
+      vertical_strength: 0.22
+      bloom_size: 9
+      bloom_strength: 0.08
+      max_add: 0.35
+      color: [1.0, 0.92, 0.78]
+      mask_sky: false
+      mask_egocar: true
   losses:
     rgb:
       w: 0.8
+      saturation_aware_reweight:
+        enabled: true
+        luma_start: 0.70
+        clip_start: 0.92
+        luma_w: 1.0
+        clip_w: 1.5
+        flatness_w: 0.5
+        flatness_scale: 0.03
+        min_confidence: 0.08
+        rear_camera_ids: [6, 7, 10, 11, 12]
+        rear_camera_weight: 0.9
+        supported_highlight_rescue:
+          enabled: true
+          luma_thresh: 0.82
+          confidence_floor: 0.30
+          use_dynamic_mask: true
+          use_lidar_depth: true
+          use_edge_support: true
+          edge_thresh: 0.08
+        highlight_floor:
+          enabled: true
+          w: 0.05
+          supported_only: true
+          target_ratio: 0.70
+          min_luma: 0.45
+          max_luma: 0.85
+          risk_min: 0.15
+      bright_region_reweight:
+        enabled: false
+        luma_thresh: 0.85
+        weight: 0.3
+        rear_camera_ids: [6, 7, 10, 11, 12]
+        rear_camera_weight: 2.0
+    highlight_geometry_suppression:
+      enabled: true
+      w: 0.04
+      luma_thresh: 0.90
+      rear_camera_ids: [6, 7, 10, 11, 12]
+      rear_camera_extra_weight: 2.5
     ssim:
       w: 0.2
     mask:
@@ -29,6 +83,29 @@ trainer:
       inverse_depth: False # whether to use inverse depth, NOTE that when set to True, must normalize=True
       normalize: False # whether to normalize depth loss
       loss_type: l1 # choose from ["l1", "l2"]
+    free_space:
+      enabled: true
+      w: 0.03
+      margin: 0.5
+      opacity_power: 1.0
+      opacity_floor: 0.0
+      mask_dynamic: false
+      non_road_only: false
+      bright_region_reweight: true
+      bright_luma_thresh: 0.9
+      bright_weight: 0.7
+      rear_camera_ids: [6, 7, 10, 11, 12]
+      rear_camera_weight: 2.5
+      rear_pseudo_enabled: true
+      rear_pseudo_weight: 0.25
+      rear_pseudo_margin: 0.6
+      rear_pseudo_max_lidar_ratio: 0.02
+      rear_pseudo_min_depth: 0.5
+      rear_pseudo_max_depth: 80.0
+      rear_pseudo_mask_sky: true
+      rear_pseudo_grad_confidence: true
+      rear_pseudo_grad_scale: 1.5
+      rear_pseudo_conf_min: 0.05
     road:
       w: 1
     affine:
@@ -51,6 +128,24 @@ trainer:
       lr: 0.005
     rotation:
       lr: 0.001
+    roughness:
+      lr: 0.001
+    metallic:
+      lr: 0.001
+    normals:
+      lr: 0.001
+    asg_amplitude:
+      lr: 0.001
+    asg_sharpness:
+      lr: 0.001
+    asg_dir:
+      lr: 0.001
+    emissive:
+      lr: 0.001
+    emissive_intensity:
+      lr: 0.001
+    emissive_sh:
+      lr: 0.001
   gaussian_ctrl_general_cfg:
     warmup_steps: 500             # warmup steps for alpha
     reset_alpha_interval: 4000    # reset alpha every n steps
@@ -66,7 +161,7 @@ trainer:
     cull_screen_size: 0.15        # if a gaussian is more than this percent of screen space, cull it
     split_screen_size: 0.05       # if a gaussian is more than this percent of screen space, split it
     stop_screen_size_at: 5000     # stop culling/splitting at this step WRT screen size of gaussians
-    stop_split_at: 20000          # stop splitting at this step
+    stop_split_at: 7000           # two-stage schedule: form geometry early, then freeze structure
     sh_degree: 3                  # sh degree for gaussians
     road_sh_degree: 1
 
@@ -81,11 +176,212 @@ model:
       near_randoms: 100_000
       far_randoms: 100_000
       seg_road_type: LIDAR_AND_IMAGE # [LIDAR, IMAGE, LIDAR_AND_IMAGE]
+    ctrl:
+      use_pbr: True
+      use_emissive: True
+      use_anisotropic_emissive: True
+      emissive_sh_degree: 1
+      anisotropic_emissive_floor: 0.05
+      emissive_cone_prior:
+        enabled: true
+        axis_world: [1.0, 0.0, 0.0]
+        power: 8.0
+        floor: 0.05
+        max_gain: 4.0
+      emissive_surface_geometry:
+        enabled: true
+        dup_block: true
+        emissive_quantile: 0.995
+        min_intensity: 1.0
+        max_scale: 0.20
+      # ========== Depth Estimator Configuration (Anti-Floater System) ==========
+      depth_estimator:
+        encoder: vitl           # Depth Anything V2 encoder (vits, vitb, vitl)
+        max_depth: 80           # Maximum depth in meters
+        cache_dir: null         # Optional: cache directory for depth maps
+        max_cache_items: 100    # Max items in memory cache
+      
+      # ========== Floater Detection ==========
+      floater_detection:
+        enabled: true           # Enable floater detection and pruning
+        grad_thresh: 0.0001     # Low gradient activity threshold
+        opacity_thresh: 0.1     # Low opacity threshold
+        isolation_thresh: 2.0   # Spatial isolation threshold (scene units)
+        depth_margin: 1.0       # Max distance from depth surface (meters)
+        soft_prune_until: 14000  # extend soft pruning to keep fading haze after mid-stage
+        hard_prune_interval: 1000 # run hard prune earlier to avoid fog accumulation
+        warmup_steps: 1000      # 10k mode: preserve early structure learning
+        floater_score_thresh: 0.80 # slightly relax detection to catch haze-like floaters
+        max_soft_prune_ratio: 0.02
+        soft_opacity_shrink: 0.990
+        max_prune_ratio_per_hard_step: 0.004
+        max_candidate_prune_ratio: 0.40
+        reset_alpha_soft_only: true
+        reset_alpha_grace_steps: 1000
+        protect_high_opacity_thresh: 0.7
+        protect_high_grad_percentile: 0.85
+        protect_surface_distance: 0.50
+        far_surface_priority_weight: 0.05
+        light_far_surface_margin: 1.0
+        free_space_priority_weight: 0.35
+        free_space_priority_margin: 0.60
+      
+      # ========== Surface-Guided Densification ==========
+      surface_guided_densification:
+        enabled: true           # Enable surface-guided split/clone
+        pull_factor: 0.5        # How much to pull split Gaussians toward surface
+        max_dup_distance: 0.8   # tighter clone gating near surfaces
+        bright_region_densify_scale: 1.05
+        bright_luma_quantile: 0.98
+        bright_luma_min: 0.7
+        bright_emissive_quantile: 0.998
+        bright_emissive_min: 1.0
+        bright_surface_distance_min: 0.40
+        suppress_foggy_growth: true
+        fog_seed_opacity_max: 0.35
+        fog_seed_opacity_soft_max: 0.50
+        fog_seed_low_grad_scale: 1.20
+        free_space_seed_distance_min: 0.60
+        free_space_seed_opacity_max: 0.45
+        free_space_seed_only_bright: false
+        free_space_split_block: true
+        free_space_dup_keep_ratio: 0.15
+        fog_gate_debug: true
+        max_split_distance: 0.8
+        max_new_points_ratio_per_refine: 0.03
+        dynamic_budget_from_floater_ratio: true
+        floater_ratio_budget_trigger: 0.01
+        dynamic_max_new_points_ratio_per_refine: 0.015
+        bright_new_points_ratio_cap: 0.12
+        free_space_new_points_ratio_cap: 0.03
+        split_new_points_ratio: 0.45
+        bg_growth_cap_ratio_before_8k: 1.8
+        bg_growth_cap_until_step: 8000
+        adaptive_stop_split_at: 6500
+        supported_highlight_geometry:
+          enabled: true
+          luma_min: 0.65
+          emissive_min: 0.8
+          surface_distance_max: 0.35
+          block_duplicate: true
+          surface_split_only: true
+          max_surface_samples: 50000
+        growth_pressure_floater_ratio: 0.015
+        growth_pressure_floater_ratio_hard: 0.03
+        growth_pressure_scale: 0.70
+        growth_pressure_scale_hard: 0.45
+        growth_pressure_ratio: 1.8
+        growth_pressure_ratio_hard: 2.2
+        growth_pressure_ratio_scale: 0.75
+        growth_pressure_ratio_scale_hard: 0.45
+        growth_control_schedule:
+          - until_step: 3000
+            max_new_points_ratio_per_refine: 0.03
+            dynamic_max_new_points_ratio_per_refine: 0.015
+            split_new_points_ratio: 0.45
+          - until_step: 6500
+            max_new_points_ratio_per_refine: 0.02
+            dynamic_max_new_points_ratio_per_refine: 0.012
+            split_new_points_ratio: 0.40
+            bright_new_points_ratio_cap: 0.10
+          - until_step: -1
+            max_new_points_ratio_per_refine: 0.015
+            dynamic_max_new_points_ratio_per_refine: 0.010
+            split_new_points_ratio: 0.35
+            budget_scale: 0.80
+        # Hard anti-fog gate: block risky split/dup from source.
+        fog_hard_gate_schedule:
+          # Stage A (0~10k): hard gate, prioritize no-fog geometry.
+          - until_step: 10000
+            split_surface_distance_max: 0.35
+            dup_surface_distance_max: 0.25
+            split_min_grad_scale: 1.30
+            fog_min_grad_scale: 1.30
+            free_space_no_growth: true
+            free_space_split_block: true
+            free_space_dup_keep_ratio: 0.00
+            unsupported_highlight_no_growth: true
+            unsupported_highlight_opacity_max: 0.60
+            bright_low_opacity_no_growth: true
+            bright_low_opacity_max: 0.50
+          # Stage B (10k~16k): keep gate, allow only minimal recovery growth.
+          - until_step: 16000
+            split_surface_distance_max: 0.45
+            dup_surface_distance_max: 0.35
+            split_min_grad_scale: 1.10
+            fog_min_grad_scale: 1.10
+            free_space_no_growth: true
+            free_space_split_block: true
+            free_space_dup_keep_ratio: 0.02
+            unsupported_highlight_no_growth: true
+            unsupported_highlight_opacity_max: 0.50
+            bright_low_opacity_no_growth: true
+            bright_low_opacity_max: 0.40
+          # Stage C (16k+): soften for appearance refinement.
+          - until_step: -1
+            split_surface_distance_max: 0.60
+            dup_surface_distance_max: 0.45
+            split_min_grad_scale: 0.80
+            fog_min_grad_scale: 0.80
+            free_space_no_growth: false
+            free_space_split_block: true
+            free_space_dup_keep_ratio: 0.10
+            unsupported_highlight_no_growth: false
+            unsupported_highlight_opacity_max: 0.40
+            bright_low_opacity_no_growth: false
+            bright_low_opacity_max: 0.30
+        highlight_emission_first: true
+        highlight_emissive_intensity_min: 1.0
+        highlight_low_opacity_max: 0.35
+        highlight_duplicate_priority: true
+        highlight_split_budget_ratio_cap: 0.25
+    
     reg:
       sharp_shape_reg:
         w: 1.
         step_interval: 10
         max_gauss_ratio: 10.       # threshold of ratio of gaussian max to min scale before applying regularization loss from the PhysGaussian paper
+      
+      # ========== Anti-Floater Regularizations ==========
+      spatial_sparsity:
+        enabled: true
+        w: 0.01                 # Loss weight
+        grid_size: 1.0          # Voxel size for grouping
+        max_density: 10.0       # Max gaussians per unit opacity
+        distance_scale: 2.0     # Scale for distance weighting
+      
+      depth_consistency:
+        w: 0.12                 # keep stronger geometry anchor while suppressing floater growth
+        max_surface_distance: 0.5 # Max distance from depth surface (meters)
+        use_ray_consistency: true # Use ray-based consistency
+      emissive_sparsity:
+        w: 0.01
+      anisotropic_emissive:
+        enabled: true
+        w: 0.005
+        back_ratio: 0.30
+      emissive_surface_support:
+        enabled: true
+        w: 0.05
+        margin: 0.15
+        max_points: 256
+        max_surface_samples: 50000
+      emissive_cluster:
+        enabled: true
+        w: 0.01
+        target_radius: 0.25
+        max_points: 128
+
+  GlobalLighting:
+    type: models.modules.GlobalLightingModule
+    params:
+      sh_degree: 2
+      hidden_dim: 64
+      num_layers: 4
+      appearance_embedding_dim: 16
+    optim:
+      all:
+        lr: 0.001
   RigidNodes:
     type: models.nodes.RigidNodes
     init:
@@ -339,7 +635,7 @@ render:
 
 # ------------- logging ------------ #
 logging:
-  vis_freq: 5000 # how often to visualize training stats
-  print_freq: 1000 # how often to print training stats
+  vis_freq: 2000 # how often to visualize training stats
+  print_freq: 500 # how often to print training stats
   saveckpt_freq: 20000 # how often to save checkpoints
   save_seperate_video: True # whether to save seperate videos for each scene

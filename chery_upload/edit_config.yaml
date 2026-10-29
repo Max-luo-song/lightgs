@@ -1,0 +1,24 @@
+is_legend: false # render legend to link instance and instance id
+Nodes:
+  RigidNodes:
+    # trajectory:
+    #   instance_id: 
+    #   - 1
+    #   offset: #[x, y, z]
+    #   - [-10, -0.7, 0]
+    remove:
+      instance_id: 
+      - 1
+    # replace:
+    #   target_id:
+    #   - 1
+    #   replace_obj: # path -> digital asset, instance id -> instance already in scene
+    #   - "/inspire/hdd/global_user/lichaoyang-240108120078/scene_reconstruction/data/assets/car_ambulance.ply"
+    #   - 2
+    # add:
+    #   ref_id: # the reference trajectory 
+    #   - 1
+    #   add_obj:
+    #   - "/inspire/hdd/global_user/lichaoyang-240108120078/scene_reconstruction/data/assets/car_ambulance.ply"
+    #   offset: # offset the reference trajectory to create a new trajectory for added instance 
+    #   - [10, 0, 0.3]

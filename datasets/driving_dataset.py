@@ -189,10 +189,23 @@ class DrivingDataset(SceneDataset):
                 device=self.device,
             )
             lidar_source.to(self.device)
-            assert (
-                pixel_source._unique_normalized_timestamps
-                - lidar_source._unique_normalized_timestamps
-            ).abs().sum().item() == 0.0, "The timestamps of the pixel source and the lidar source are not synchronized"
+            pixel_ts = pixel_source._unique_normalized_timestamps
+            lidar_ts = lidar_source._unique_normalized_timestamps
+            if pixel_ts.shape[0] == lidar_ts.shape[0]:
+                max_abs_diff = (pixel_ts - lidar_ts).abs().max().item()
+                if max_abs_diff > 1e-6:
+                    logger.warning(
+                        "Pixel/LiDAR timestamps are not exactly synchronized (max diff=%.3e). "
+                        "Using nearest-timestamp matching for depth projection.",
+                        max_abs_diff,
+                    )
+            else:
+                logger.warning(
+                    "Pixel/LiDAR timestamp count mismatch (pixel=%d, lidar=%d). "
+                    "Using nearest-timestamp matching for depth projection.",
+                    pixel_ts.shape[0],
+                    lidar_ts.shape[0],
+                )
         return pixel_source, lidar_source
 
     ### 其实相当于从雷达数据中采样，设定一个采样值，采样值通常应该小于雷达点数，如果大于雷达点数采样值就是雷达点数

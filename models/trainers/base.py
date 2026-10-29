@@ -190,6 +190,12 @@ class BasicTrainer(nn.Module):
             class_optim_cfg = class_cfg["optim"]
             
             raw_optim_cfg = class_optim_cfg.get(component_name, None)
+            if raw_optim_cfg is None:
+                raise KeyError(
+                    f"Missing optimizer config for param group '{params_name}'. "
+                    f"Please add '{component_name}' under model_config['{class_name}']['optim'] "
+                    f"or gaussian_optim_general_cfg."
+                )
             lr_scale_factor = raw_optim_cfg.get("scale_factor", 1.0)
             if isinstance(lr_scale_factor, str) and lr_scale_factor == "scene_radius":
                 # scale the spatial learning rate to scene scale
@@ -253,14 +259,74 @@ class BasicTrainer(nn.Module):
             )
         self.depth_loss_fn = depth_loss_fn
         
+        road_loss_fn = None
         if "RoadNodes" in self.models:
-            road_loss_fn = None
             road_loss_cfg = self.losses_dict.get("road", None)
             if road_loss_cfg is not None:
                 from models.losses import RoadLoss
                 road_loss_fn = RoadLoss()  # TODO(gls): args
-                self.road_loss_fn = road_loss_fn
+        self.road_loss_fn = road_loss_fn
+        
+        # Initialize depth estimator for anti-floater constraints
+        self._init_depth_estimator()
  
+    def _init_depth_estimator(self) -> None:
+        """Initialize Depth Anything V2 for depth-based floater constraints."""
+        self.depth_estimator = None
+        self.depth_cache = None
+        
+        # Check if any gaussian model has floater detection enabled
+        floater_enabled = False
+        for class_name in self.gaussian_classes.keys():
+            model_cfg = self.model_config.get(class_name, {})
+            ctrl_cfg = model_cfg.get('ctrl', {})
+            floater_cfg = ctrl_cfg.get('floater_detection', {})
+            if floater_cfg.get('enabled', False):
+                floater_enabled = True
+                break
+        
+        if not floater_enabled:
+            return
+            
+        try:
+            from utils.depth_estimator import create_depth_estimator, DepthCache
+            
+            # Get depth estimator config from first gaussian with floater detection
+            depth_cfg = None
+            for class_name in self.gaussian_classes.keys():
+                model_cfg = self.model_config.get(class_name, {})
+                ctrl_cfg = model_cfg.get('ctrl', {})
+                depth_cfg = ctrl_cfg.get('depth_estimator', {})
+                if depth_cfg:
+                    break
+            
+            if depth_cfg is None:
+                depth_cfg = {}
+            
+            encoder = depth_cfg.get('encoder', 'vitl')
+            max_depth = depth_cfg.get('max_depth', 80)
+            
+            # Create depth estimator
+            self.depth_estimator = create_depth_estimator(
+                encoder=encoder,
+                mode='metric',
+                max_depth=max_depth,
+                device=self.device
+            )
+            
+            # Create depth cache
+            cache_dir = depth_cfg.get('cache_dir', None)
+            if cache_dir:
+                self.depth_cache = DepthCache(
+                    cache_dir=cache_dir,
+                    max_memory_items=depth_cfg.get('max_cache_items', 100)
+                )
+            
+            logger.info(f"Depth estimator initialized: encoder={encoder}, max_depth={max_depth}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to initialize depth estimator: {e}")
+            self.depth_estimator = None
     def optimizer_zero_grad(self) -> None:
         self.optimizer.zero_grad()
     
@@ -529,6 +595,10 @@ class BasicTrainer(nn.Module):
             if hasattr(model, 'in_test_set'):
                 model.in_test_set = self.in_test_set
         
+        # Update depth points for floater detection if depth estimator is available
+        if self.depth_estimator is not None and self.training:
+            self._update_depth_points(image_infos, camera_infos)
+        
         # prapare data
         processed_cam = self.process_camera(
             camera_infos=camera_infos,
@@ -562,6 +632,84 @@ class BasicTrainer(nn.Module):
         
         return outputs
     
+    def _update_depth_points(
+        self,
+        image_infos: Dict[str, torch.Tensor],
+        camera_infos: Dict[str, torch.Tensor]
+    ) -> None:
+        """Estimate depth and update depth points for gaussian models.
+        
+        This is called during training to provide depth constraints for floater detection.
+        """
+        try:
+            depth_map = self._get_or_estimate_depth_map(image_infos, camera_infos)
+            if depth_map is None:
+                return
+            # Get camera parameters
+            intrinsics = camera_infos["intrinsics"]
+            c2w = camera_infos["camera_to_world"]
+            
+            # Convert depth to 3D points
+            depth_points = self.depth_estimator.depth_to_points(
+                depth_map,
+                intrinsics.cpu().numpy() if isinstance(intrinsics, torch.Tensor) else intrinsics,
+                c2w.cpu().numpy() if isinstance(c2w, torch.Tensor) else c2w,
+                min_depth=0.5,
+                max_depth=80.0,
+                subsample=4  # Subsample for efficiency
+            )
+            
+            # Update gaussian models with depth points
+            depth_points_tensor = torch.from_numpy(depth_points).float().to(self.device)
+            for class_name in self.gaussian_classes.keys():
+                model = self.models.get(class_name)
+                if model is not None and hasattr(model, 'set_depth_points'):
+                    model.set_depth_points(depth_points_tensor)
+                    
+        except Exception as e:
+            # Log but don't fail training
+            if self.step % 1000 == 0:
+                logger.debug(f"Depth estimation failed at step {self.step}: {e}")
+
+    def _get_or_estimate_depth_map(
+        self,
+        image_infos: Dict[str, torch.Tensor],
+        camera_infos: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Fetch a cached depth map or estimate one from the current image."""
+        if self.depth_estimator is None:
+            return None
+
+        img_path = image_infos.get("img_path", None)
+        if img_path is None:
+            return None
+
+        cache_key = img_path if isinstance(img_path, str) else str(img_path)
+        height = camera_infos["height"].item() if hasattr(camera_infos["height"], "item") else camera_infos["height"]
+        width = camera_infos["width"].item() if hasattr(camera_infos["width"], "item") else camera_infos["width"]
+
+        depth_map = None
+        if self.depth_cache is not None:
+            depth_map = self.depth_cache.get(cache_key)
+
+        if depth_map is None:
+            depth_map = self.depth_estimator.estimate_depth(img_path, return_tensor=True)
+            if self.depth_cache is not None:
+                self.depth_cache.put(cache_key, depth_map)
+
+        if not isinstance(depth_map, torch.Tensor):
+            depth_map = torch.from_numpy(depth_map)
+        depth_map = depth_map.float().to(self.device)
+
+        if depth_map.shape[0] != height or depth_map.shape[1] != width:
+            depth_map = torch.nn.functional.interpolate(
+                depth_map.unsqueeze(0).unsqueeze(0),
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze()
+        return depth_map
+    
     def backward(self, loss_dict: Dict[str, torch.Tensor]) -> None:
         # ----------------- backward ----------------
         total_loss = sum(loss for loss in loss_dict.values())
@@ -577,6 +725,189 @@ class BasicTrainer(nn.Module):
                 if group["name"] in self.lr_schedulers:
                     new_lr = self.lr_schedulers[group["name"]](self.step)
                     group["lr"] = new_lr
+
+    def _compute_free_space_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        image_infos: Dict[str, torch.Tensor],
+        cam_infos: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        free_space_cfg = self.losses_dict.get("free_space", None)
+        if free_space_cfg is None or not free_space_cfg.get("enabled", False):
+            return None
+
+        pred_depth = outputs.get("depth", None)
+        pred_opacity = outputs.get("opacity", None)
+        if pred_depth is None or pred_opacity is None:
+            return None
+
+        pred_depth = pred_depth.squeeze()
+        pred_opacity = pred_opacity.squeeze()
+
+        base_mask = torch.ones_like(pred_depth, dtype=torch.float32)
+        if "egocar_masks" in image_infos:
+            base_mask = base_mask * (1.0 - image_infos["egocar_masks"]).float()
+
+        if bool(free_space_cfg.get("mask_dynamic", True)) and "dynamic_masks" in image_infos:
+            base_mask = base_mask * (1.0 - image_infos["dynamic_masks"]).float()
+
+        if bool(free_space_cfg.get("non_road_only", False)) and "road_masks" in image_infos:
+            base_mask = base_mask * (~image_infos["road_masks"].bool()).float()
+
+        if base_mask.sum().item() <= 0:
+            return None
+
+        cam_id_val = None
+        if "cam_id" in cam_infos:
+            cam_id_tensor = cam_infos["cam_id"]
+            if isinstance(cam_id_tensor, torch.Tensor):
+                cam_id_val = int(cam_id_tensor.flatten()[0].item())
+
+        under_depth_margin = float(free_space_cfg.get("margin", 0.5))
+        opacity_power = float(free_space_cfg.get("opacity_power", 1.0))
+        opacity_floor = float(free_space_cfg.get("opacity_floor", 0.0))
+        free_space_weight = float(free_space_cfg.get("w", 1.0))
+        opacity_term = torch.clamp(pred_opacity, min=opacity_floor, max=1.0) ** opacity_power
+
+        pixel_weight = torch.ones_like(base_mask)
+        if bool(free_space_cfg.get("bright_region_reweight", True)):
+            luma = (
+                0.299 * image_infos["pixels"][..., 0]
+                + 0.587 * image_infos["pixels"][..., 1]
+                + 0.114 * image_infos["pixels"][..., 2]
+            )
+            luma_thresh = float(free_space_cfg.get("bright_luma_thresh", 0.90))
+            bright_weight = float(free_space_cfg.get("bright_weight", 0.5))
+            bright_weight = float(np.clip(bright_weight, 0.05, 1.0))
+            pixel_weight = torch.where(
+                luma > luma_thresh,
+                torch.full_like(pixel_weight, bright_weight),
+                pixel_weight,
+            )
+
+        lidar_term = None
+        gt_depth = image_infos.get("lidar_depth_map", None)
+        lidar_valid = None
+        if gt_depth is not None:
+            gt_depth = gt_depth.squeeze()
+            lidar_valid = (gt_depth > 0).float() * base_mask
+            if lidar_valid.sum().item() > 0:
+                depth_gap = torch.relu((gt_depth - under_depth_margin) - pred_depth)
+                weighted_violation = depth_gap * opacity_term * lidar_valid * pixel_weight
+                denom = (lidar_valid * pixel_weight).sum() + 1e-6
+                if denom.item() > 0:
+                    lidar_term = weighted_violation.sum() / denom
+
+        rear_pseudo_term = None
+        rear_camera_ids = set(free_space_cfg.get("rear_camera_ids", []))
+        rear_camera_weight = float(free_space_cfg.get("rear_camera_weight", 1.0))
+        camera_weight = rear_camera_weight if cam_id_val in rear_camera_ids else 1.0
+
+        rear_pseudo_enabled = bool(free_space_cfg.get("rear_pseudo_enabled", False))
+        if (
+            rear_pseudo_enabled
+            and cam_id_val in rear_camera_ids
+            and self.depth_estimator is not None
+        ):
+            lidar_ratio = 0.0
+            if lidar_valid is not None:
+                lidar_ratio = float((lidar_valid.sum() / (base_mask.sum() + 1e-6)).item())
+            max_lidar_ratio = float(free_space_cfg.get("rear_pseudo_max_lidar_ratio", 0.02))
+
+            if lidar_ratio <= max_lidar_ratio:
+                pseudo_depth = self._get_or_estimate_depth_map(image_infos, cam_infos)
+                if pseudo_depth is not None:
+                    pseudo_min_depth = float(free_space_cfg.get("rear_pseudo_min_depth", 0.5))
+                    pseudo_max_depth = float(
+                        free_space_cfg.get(
+                            "rear_pseudo_max_depth",
+                            getattr(self.depth_estimator, "max_depth", 80.0),
+                        )
+                    )
+                    pseudo_valid = ((pseudo_depth > pseudo_min_depth) & (pseudo_depth < pseudo_max_depth)).float()
+                    pseudo_valid = pseudo_valid * base_mask
+
+                    if bool(free_space_cfg.get("rear_pseudo_mask_sky", True)) and "sky_masks" in image_infos:
+                        pseudo_valid = pseudo_valid * (1.0 - image_infos["sky_masks"]).float()
+
+                    if pseudo_valid.sum().item() > 0:
+                        pseudo_margin = float(free_space_cfg.get("rear_pseudo_margin", under_depth_margin))
+                        pseudo_gap = torch.relu((pseudo_depth - pseudo_margin) - pred_depth)
+
+                        pseudo_conf = torch.ones_like(pseudo_gap)
+                        if bool(free_space_cfg.get("rear_pseudo_grad_confidence", True)):
+                            dy = torch.abs(pseudo_depth[1:, :] - pseudo_depth[:-1, :])
+                            dx = torch.abs(pseudo_depth[:, 1:] - pseudo_depth[:, :-1])
+                            grad_mag = torch.zeros_like(pseudo_depth)
+                            grad_mag[:-1, :] += dy
+                            grad_mag[:, :-1] += dx
+                            grad_scale = float(free_space_cfg.get("rear_pseudo_grad_scale", 2.0))
+                            pseudo_conf = pseudo_conf * torch.exp(-grad_scale * grad_mag)
+
+                        pseudo_conf = torch.clamp(
+                            pseudo_conf,
+                            min=float(free_space_cfg.get("rear_pseudo_conf_min", 0.05)),
+                            max=1.0,
+                        )
+                        weighted_pseudo = pseudo_gap * opacity_term * pseudo_valid * pixel_weight * pseudo_conf
+                        denom_pseudo = (pseudo_valid * pixel_weight * pseudo_conf).sum() + 1e-6
+                        if denom_pseudo.item() > 0:
+                            rear_pseudo_term = weighted_pseudo.sum() / denom_pseudo
+
+        if lidar_term is None and rear_pseudo_term is None:
+            return None
+
+        rear_pseudo_weight = float(free_space_cfg.get("rear_pseudo_weight", 0.2))
+        total_term = 0.0
+        if lidar_term is not None:
+            total_term = total_term + lidar_term
+        if rear_pseudo_term is not None:
+            total_term = total_term + rear_pseudo_weight * rear_pseudo_term
+
+        return free_space_weight * camera_weight * total_term
+
+    def _compute_saturation_confidence(
+        self,
+        pixels: torch.Tensor,
+        cfg,
+        valid_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        pixels = torch.clamp(pixels, 0.0, 1.0)
+        luma = 0.299 * pixels[..., 0] + 0.587 * pixels[..., 1] + 0.114 * pixels[..., 2]
+        luma_start = float(cfg.get("luma_start", 0.70))
+        high_luma = torch.clamp((luma - luma_start) / max(1e-6, 1.0 - luma_start), 0.0, 1.0)
+
+        clip_start = float(cfg.get("clip_start", 0.92))
+        clipped_channels = torch.clamp((pixels - clip_start) / max(1e-6, 1.0 - clip_start), 0.0, 1.0)
+        channel_clipping = clipped_channels.min(dim=-1).values
+
+        dy = torch.abs(luma[1:, :] - luma[:-1, :])
+        dx = torch.abs(luma[:, 1:] - luma[:, :-1])
+        grad_mag = torch.zeros_like(luma)
+        grad_mag[:-1, :] += dy
+        grad_mag[:, :-1] += dx
+        flatness_scale = float(cfg.get("flatness_scale", 0.03))
+        flatness = torch.exp(-grad_mag / max(flatness_scale, 1e-6))
+
+        sat_score = (
+            float(cfg.get("luma_w", 1.0)) * high_luma
+            + float(cfg.get("clip_w", 1.5)) * channel_clipping
+            + float(cfg.get("flatness_w", 0.5)) * high_luma * channel_clipping * flatness
+        )
+        confidence = torch.exp(-sat_score)
+        confidence = torch.clamp(confidence, min=float(cfg.get("min_confidence", 0.05)), max=1.0)
+        return torch.where(valid_mask > 0, confidence, torch.ones_like(confidence))
+
+    def _scheduled_loss_weight(self, cfg, key: str, default: float) -> float:
+        weight = float(cfg.get(key, default))
+        start_iter = int(cfg.get(f"{key}_start_iter", cfg.get("start_iter", 0)))
+        ramp_iters = int(cfg.get(f"{key}_ramp_iters", cfg.get("ramp_iters", 0)))
+        if self.step < start_iter:
+            return 0.0
+        if ramp_iters > 0:
+            progress = min(1.0, max(0.0, float(self.step - start_iter) / float(ramp_iters)))
+            weight *= progress
+        return weight
                 
     def compute_losses(
         self,
@@ -608,12 +939,131 @@ class BasicTrainer(nn.Module):
         pred_occupied_mask = outputs["opacity"].squeeze() * valid_loss_mask
         
         ### NOTE(gls): 非路面区域的rgb_loss
-        Ll1 = torch.abs(gt_rgb - predicted_rgb).mean()
+        rgb_err = torch.abs(gt_rgb - predicted_rgb)
+        sat_cfg = self.losses_dict.rgb.get("saturation_aware_reweight", None)
+        bright_cfg = self.losses_dict.rgb.get("bright_region_reweight", None)
+        cam_id_val = None
+        if "cam_id" in cam_infos:
+            cam_id_tensor = cam_infos["cam_id"]
+            if isinstance(cam_id_tensor, torch.Tensor):
+                cam_id_val = int(cam_id_tensor.flatten()[0].item())
+        if sat_cfg is not None and sat_cfg.get("enabled", False):
+            weight_mask = valid_loss_mask * non_road_mask.float()
+            confidence = self._compute_saturation_confidence(
+                pixels=image_infos["pixels"],
+                cfg=sat_cfg,
+                valid_mask=weight_mask,
+            )
+            rear_camera_ids = set(sat_cfg.get("rear_camera_ids", []))
+            rear_camera_weight = float(sat_cfg.get("rear_camera_weight", 1.0))
+            if cam_id_val in rear_camera_ids:
+                confidence = torch.clamp(confidence * rear_camera_weight, max=1.0)
+
+            gt_luma = (
+                0.299 * image_infos["pixels"][..., 0]
+                + 0.587 * image_infos["pixels"][..., 1]
+                + 0.114 * image_infos["pixels"][..., 2]
+            )
+            sat_risk = torch.clamp(1.0 - confidence, min=0.0, max=1.0)
+            rescue_cfg = sat_cfg.get("supported_highlight_rescue", None)
+            supported_highlight = torch.zeros_like(weight_mask, dtype=torch.bool)
+            if rescue_cfg is not None and rescue_cfg.get("enabled", False):
+                highlight_mask = gt_luma > float(rescue_cfg.get("luma_thresh", 0.82))
+                support_mask = torch.zeros_like(highlight_mask)
+                if bool(rescue_cfg.get("use_dynamic_mask", True)) and "dynamic_masks" in image_infos:
+                    support_mask = support_mask | (image_infos["dynamic_masks"].bool())
+                if bool(rescue_cfg.get("use_lidar_depth", True)) and "lidar_depth_map" in image_infos:
+                    support_mask = support_mask | (image_infos["lidar_depth_map"].squeeze() > 0)
+                if bool(rescue_cfg.get("use_edge_support", True)):
+                    dy = torch.abs(gt_luma[1:, :] - gt_luma[:-1, :])
+                    dx = torch.abs(gt_luma[:, 1:] - gt_luma[:, :-1])
+                    grad_mag = torch.zeros_like(gt_luma)
+                    grad_mag[:-1, :] += dy
+                    grad_mag[:, :-1] += dx
+                    support_mask = support_mask | (grad_mag > float(rescue_cfg.get("edge_thresh", 0.08)))
+                supported_highlight = highlight_mask & support_mask & (weight_mask > 0)
+                if supported_highlight.any():
+                    confidence_floor = float(rescue_cfg.get("confidence_floor", 0.28))
+                    confidence = torch.where(
+                        supported_highlight,
+                        torch.maximum(confidence, torch.full_like(confidence, confidence_floor)),
+                        confidence,
+                    )
+
+            weighted_err = rgb_err * confidence[..., None]
+            denom = (weight_mask * confidence).sum() * 3.0 + 1e-6
+            Ll1 = weighted_err.sum() / denom
+
+            floor_cfg = sat_cfg.get("highlight_floor", None)
+            if floor_cfg is not None and floor_cfg.get("enabled", False):
+                pred_luma = (
+                    0.299 * outputs["rgb"][..., 0]
+                    + 0.587 * outputs["rgb"][..., 1]
+                    + 0.114 * outputs["rgb"][..., 2]
+                )
+                if bool(floor_cfg.get("supported_only", True)):
+                    floor_mask = supported_highlight.float()
+                else:
+                    floor_mask = ((gt_luma > float(floor_cfg.get("luma_thresh", 0.82))).float() * weight_mask)
+                floor_weight = floor_mask * torch.clamp(sat_risk, min=float(floor_cfg.get("risk_min", 0.15)), max=1.0)
+                target_luma = torch.clamp(
+                    gt_luma * float(floor_cfg.get("target_ratio", 0.70)),
+                    min=float(floor_cfg.get("min_luma", 0.45)),
+                    max=float(floor_cfg.get("max_luma", 0.85)),
+                )
+                floor_loss = torch.relu(target_luma - pred_luma)
+                denom_floor = floor_weight.sum() + 1e-6
+                if denom_floor.item() > 0:
+                    loss_dict["saturation_highlight_floor"] = (
+                        float(floor_cfg.get("w", 0.05))
+                        * (floor_loss * floor_weight).sum()
+                        / denom_floor
+                    )
+        elif bright_cfg is not None and bright_cfg.get("enabled", False):
+            luma = (
+                0.299 * image_infos["pixels"][..., 0]
+                + 0.587 * image_infos["pixels"][..., 1]
+                + 0.114 * image_infos["pixels"][..., 2]
+            )
+            luma_thresh = bright_cfg.get("luma_thresh", 0.85)
+            bright_weight = bright_cfg.get("weight", 0.3)
+            bright_weight = float(np.clip(bright_weight, 0.05, 1.0))
+            rear_camera_ids = set(bright_cfg.get("rear_camera_ids", []))
+            rear_camera_weight = float(bright_cfg.get("rear_camera_weight", 1.0))
+            camera_weight = rear_camera_weight if cam_id_val in rear_camera_ids else 1.0
+            pixel_w = torch.ones_like(valid_loss_mask)
+            bright_mask = (luma > luma_thresh).float() * valid_loss_mask * non_road_mask.float()
+            weighted_bright = float(np.clip(bright_weight * camera_weight, 0.05, 3.0))
+            pixel_w = torch.where(bright_mask > 0, torch.full_like(pixel_w, weighted_bright), pixel_w)
+            weighted_err = rgb_err * pixel_w[..., None]
+            denom = (valid_loss_mask * non_road_mask.float() * pixel_w).sum() * 3.0 + 1e-6
+            Ll1 = weighted_err.sum() / denom
+        else:
+            Ll1 = rgb_err.mean()
         simloss = 1 - self.ssim(gt_rgb.permute(2, 0, 1)[None, ...], predicted_rgb.permute(2, 0, 1)[None, ...])
         loss_dict.update({
             "rgb_loss": self.losses_dict.rgb.w * Ll1,
             "ssim_loss": self.losses_dict.ssim.w * simloss,
         })
+
+        # Explicitly discourage using dense geometry opacity to fit over-exposed highlights.
+        # This nudges the model away from fog-like Gaussian accumulation in strong-light regions.
+        highlight_geo_cfg = self.losses_dict.get("highlight_geometry_suppression", None)
+        if highlight_geo_cfg is not None and highlight_geo_cfg.get("enabled", False):
+            luma = (
+                0.299 * image_infos["pixels"][..., 0]
+                + 0.587 * image_infos["pixels"][..., 1]
+                + 0.114 * image_infos["pixels"][..., 2]
+            )
+            luma_thresh = float(highlight_geo_cfg.get("luma_thresh", 0.9))
+            geo_w = float(highlight_geo_cfg.get("w", 0.01))
+            rear_camera_ids = set(highlight_geo_cfg.get("rear_camera_ids", []))
+            rear_extra = float(highlight_geo_cfg.get("rear_camera_extra_weight", 1.0))
+            camera_mul = rear_extra if cam_id_val in rear_camera_ids else 1.0
+            highlight_mask = (luma > luma_thresh).float() * valid_loss_mask * non_road_mask.float()
+            if highlight_mask.sum() > 0:
+                highlight_opacity = (outputs["opacity"].squeeze() * highlight_mask).sum() / (highlight_mask.sum() + 1e-6)
+                loss_dict["highlight_geometry_suppression"] = geo_w * camera_mul * highlight_opacity
         
         # mask loss
         if self.sky_opacity_loss_fn is not None:
@@ -641,7 +1091,10 @@ class BasicTrainer(nn.Module):
                 loss_dict.update({"depth_loss": depth_loss})
             else:
                 logger.debug("No valid lidar points for depth loss")
-            
+
+        free_space_loss = self._compute_free_space_loss(outputs, image_infos, cam_infos)
+        if free_space_loss is not None:
+            loss_dict["free_space_loss"] = free_space_loss
 
         # NOTE(gls): add road loss
         if self.road_loss_fn is not None:

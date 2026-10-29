@@ -1,5 +1,6 @@
 from typing import Dict, Optional
 import torch
+import torch.nn.functional as F
 import logging
 
 from datasets.driving_dataset import DrivingDataset
@@ -29,6 +30,65 @@ class MultiTrainer(BasicTrainer):
         
     def register_normalized_timestamps(self, num_timestamps: int):
         self.normalized_timestamps = torch.linspace(0, 1, num_timestamps, device=self.device)
+
+    def _apply_camera_flare(
+        self,
+        world_rgb: torch.Tensor,
+        image_infos: Dict[str, torch.Tensor],
+        camera_infos: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        flare_cfg = self.render_cfg.get("camera_flare", None)
+        if flare_cfg is None or not bool(flare_cfg.get("enabled", False)):
+            return torch.zeros_like(world_rgb)
+        if self.training and self.step < int(flare_cfg.get("start_iter", 0)):
+            return torch.zeros_like(world_rgb)
+
+        cam_id_val = None
+        if "cam_id" in camera_infos:
+            cam_id_tensor = camera_infos["cam_id"]
+            if isinstance(cam_id_tensor, torch.Tensor):
+                cam_id_val = int(cam_id_tensor.flatten()[0].item())
+        enabled_camera_ids = flare_cfg.get("camera_ids", None)
+        if enabled_camera_ids is not None and cam_id_val not in set(enabled_camera_ids):
+            return torch.zeros_like(world_rgb)
+
+        flare_source = world_rgb.detach()
+        luma = 0.299 * flare_source[..., 0] + 0.587 * flare_source[..., 1] + 0.114 * flare_source[..., 2]
+        core_thresh = float(flare_cfg.get("core_luma_thresh", 0.70))
+        core = torch.clamp((luma - core_thresh) / max(1e-6, 1.0 - core_thresh), 0.0, 1.0)
+        core = core ** float(flare_cfg.get("core_power", 1.5))
+        if bool(flare_cfg.get("mask_sky", False)) and "sky_masks" in image_infos:
+            core = core * (1.0 - image_infos["sky_masks"]).float()
+        if bool(flare_cfg.get("mask_egocar", True)) and "egocar_masks" in image_infos:
+            core = core * (1.0 - image_infos["egocar_masks"]).float()
+
+        core_nchw = core[None, None, ...]
+        dtype = world_rgb.dtype
+        device = world_rgb.device
+
+        vertical_size = int(flare_cfg.get("vertical_size", 121))
+        vertical_size = max(3, vertical_size + (1 - vertical_size % 2))
+        y = torch.arange(vertical_size, device=device, dtype=dtype) - vertical_size // 2
+        vertical_decay = float(flare_cfg.get("vertical_decay", 22.0))
+        vertical_kernel = torch.exp(-torch.abs(y) / max(vertical_decay, 1e-6))
+        vertical_kernel = vertical_kernel / (vertical_kernel.sum() + 1e-6)
+        vertical = F.conv2d(core_nchw, vertical_kernel.view(1, 1, vertical_size, 1), padding=(vertical_size // 2, 0))[0, 0]
+
+        bloom_size = int(flare_cfg.get("bloom_size", 9))
+        bloom_size = max(3, bloom_size + (1 - bloom_size % 2))
+        bloom = F.avg_pool2d(core_nchw, kernel_size=bloom_size, stride=1, padding=bloom_size // 2)[0, 0]
+
+        color = torch.tensor(flare_cfg.get("color", [1.0, 0.92, 0.78]), device=device, dtype=dtype)
+        if color.numel() != 3:
+            color = torch.ones(3, device=device, dtype=dtype)
+
+        flare = (
+            float(flare_cfg.get("vertical_strength", 0.22)) * vertical[..., None]
+            + float(flare_cfg.get("bloom_strength", 0.08)) * bloom[..., None]
+        ) * color.view(1, 1, 3)
+        max_add = float(flare_cfg.get("max_add", 0.35))
+        flare = torch.clamp(flare, min=0.0, max=max_add)
+        return flare
         
     def _init_models(self):
         # gaussian model classes
@@ -408,9 +468,12 @@ class MultiTrainer(BasicTrainer):
         outputs["rgb_sky_blend"] = outputs["rgb_sky"] * (1.0 - outputs["opacity"])
         
         # affine transformation
-        outputs["rgb"] = self.affine_transformation(
+        world_rgb = self.affine_transformation(
             outputs["rgb_gaussians"] + outputs["rgb_sky"] * (1.0 - outputs["opacity"]), image_infos
         )
+        outputs["rgb_world"] = world_rgb
+        outputs["rgb_flare"] = self._apply_camera_flare(world_rgb, image_infos, camera_infos)
+        outputs["rgb"] = torch.clamp(world_rgb + outputs["rgb_flare"], 0.0, 1.0)
 
         # NOTE(gls): 对output['rgb']增加一个road mask，然后把路面独立出来
         road_mask = image_infos["road_masks"]

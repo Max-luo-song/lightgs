@@ -16,3 +16,9 @@ __pycache__/
 docker/copy/opt/requirements.txt
 .vscode
 data
+
+# Training outputs, model weights, and local caches
+/output*/
+*.pth
+*.pt
+*.ckpt
